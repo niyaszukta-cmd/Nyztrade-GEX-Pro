@@ -209,17 +209,14 @@ if user_tier == "premium":
             step=30
         )
         
-        # Initialize countdown
         if 'countdown_start' not in st.session_state:
             st.session_state.countdown_start = time.time()
         
-        # Calculate remaining time
         elapsed = time.time() - st.session_state.countdown_start
         remaining = max(0, refresh_interval - int(elapsed))
         
-        # Show countdown
         countdown_placeholder = st.sidebar.empty()
-        countdown_placeholder.markdown(f'<div class="countdown-timer">⏱️ Next refresh in: {remaining}s</div>', unsafe_allow_html=True)
+        countdown_placeholder.markdown(f'<div class="countdown-timer">⏱️ Next refresh: {remaining}s</div>', unsafe_allow_html=True)
 else:
     st.sidebar.info("🔒 Auto-refresh: Premium only")
     auto_refresh = False
@@ -265,9 +262,9 @@ if error:
     st.error(f"❌ Error: {error}")
     st.info("""
     **Troubleshooting:**
-    1. Make sure `gex_calculator.py` is uploaded to GitHub
-    2. Check `requirements.txt` includes: streamlit pandas numpy plotly scipy requests pytz
-    3. Wait 1-2 minutes for dependencies to install
+    1. Make sure gex_calculator.py is uploaded
+    2. Check requirements.txt includes: streamlit pandas numpy plotly scipy requests pytz
+    3. Wait 1-2 minutes for dependencies
     """)
     st.stop()
 
@@ -300,11 +297,11 @@ with col3:
     st.metric("Put GEX", f"{put_gex:.4f}B")
 
 with col4:
-    st.metric("Futures LTP", f"₹{futures_ltp:,.2f}")
+    st.metric("Futures LTP", f"Rs {futures_ltp:,.2f}")
 
 with col5:
     if atm_info:
-        st.metric("ATM Straddle", f"₹{atm_info['atm_straddle_premium']:.2f}")
+        st.metric("ATM Straddle", f"Rs {atm_info['atm_straddle_premium']:.2f}")
 
 # ============================================================================
 # FLOW METRICS
@@ -405,11 +402,11 @@ with tab1:
     st.plotly_chart(fig, use_container_width=True)
     
     if total_gex > 0.5:
-        st.success("🟢 **Strong Positive GEX**: Sideways to bullish market expected. Consider selling premium strategies.")
+        st.success("🟢 **Strong Positive GEX**: Sideways to bullish market expected")
     elif total_gex < -0.5:
-        st.error("🔴 **Negative GEX**: High volatility expected. Consider buying volatility strategies.")
+        st.error("🔴 **Negative GEX**: High volatility expected")
     else:
-        st.warning("⚖️ **Neutral GEX**: Mixed signals. Follow DEX for direction.")
+        st.warning("⚖️ **Neutral GEX**: Mixed signals")
 
 # TAB 2: DEX Profile
 with tab2:
@@ -444,7 +441,7 @@ with tab2:
     
     st.plotly_chart(fig2, use_container_width=True)
 
-# TAB 3: Hedging Pressure Index (NEW!)
+# TAB 3: Hedging Pressure
 with tab3:
     st.subheader(f"NYZTrade - {symbol} Hedging Pressure Index")
     
@@ -458,13 +455,12 @@ with tab3:
             color=df['Hedging_Pressure'],
             colorscale='RdYlGn',
             showscale=True,
-            colorbar=dict(title="Pressure %", x=1.15)
+            colorbar=dict(title="Pressure", x=1.15)
         ),
         name='Hedging Pressure',
         hovertemplate='<b>Strike:</b> %{y}<br><b>Pressure:</b> %{x:.2f}%<extra></extra>'
     ))
     
-    # Add volume overlay
     max_pressure = df['Hedging_Pressure'].abs().max()
     max_vol = df['Total_Volume'].max()
     
@@ -487,27 +483,19 @@ with tab3:
         y=futures_ltp,
         line_dash="dash",
         line_color="blue",
-        line_width=3,
-        annotation_text=f"Futures: {futures_ltp:,.2f}"
+        line_width=3
     )
     
     fig3.update_layout(
         height=600,
         xaxis_title="Hedging Pressure (%)",
         yaxis_title="Strike Price",
-        template='plotly_white',
-        hovermode='closest'
+        template='plotly_white'
     )
     
     st.plotly_chart(fig3, use_container_width=True)
     
-    st.info("""
-    **💡 Hedging Pressure Index Interpretation:**
-    - **+100%**: Maximum positive GEX - Strong support level
-    - **0%**: Neutral zone
-    - **-100%**: Maximum negative GEX - High volatility zone
-    - **Volume overlay**: Shows trading activity at each strike
-    """)
+    st.info("💡 **Hedging Pressure**: +100% = Max support | -100% = High volatility zone")
 
 # TAB 4: Data Table
 with tab4:
@@ -527,16 +515,16 @@ with tab4:
     
     csv = df.to_csv(index=False)
     st.download_button(
-        label="📥 Download Complete Data (CSV)",
+        label="📥 Download CSV",
         data=csv,
-        file_name=f"NYZTrade_{symbol}_GEX_{get_ist_time().strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"NYZTrade_{symbol}_{get_ist_time().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         use_container_width=True
     )
 
-# TAB 5: Enhanced Strategies (NEW!)
+# TAB 5: Strategies
 with tab5:
-    st.subheader("💡 Recommended Trading Strategies")
+    st.subheader("💡 Trading Strategies")
     
     if flow_metrics and atm_info:
         gex_bias_val = flow_metrics['gex_near_total']
@@ -550,167 +538,88 @@ with tab5:
             st.metric("DEX Flow", f"{dex_bias_val:.2f}")
         with col2:
             st.metric("ATM Strike", f"{atm_info['atm_strike']}")
-            st.metric("Straddle Premium", f"₹{atm_info['atm_straddle_premium']:.2f}")
+            st.metric("Straddle Premium", f"Rs {atm_info['atm_straddle_premium']:.2f}")
         
         st.markdown("---")
         
-        # SCENARIO 1: Strong Positive GEX
+        # Strong Positive GEX
         if gex_bias_val > 50:
-            st.success("### 🟢 SCENARIO: Strong Positive GEX (Sideways/Bullish)")
+            st.success("### 🟢 Strong Positive GEX - Sideways/Bullish")
             
-            st.markdown("#### Strategy 1: 🦅 Iron Condor")
-            st.code(f"""
-Setup:
-  Sell {symbol} {int(futures_ltp)} CE
-  Buy  {symbol} {int(futures_ltp + 200)} CE
-  Sell {symbol} {int(futures_ltp)} PE
-  Buy  {symbol} {int(futures_ltp - 200)} PE
+            st.markdown("#### Strategy 1: Iron Condor")
+            st.text(f"""
+Sell {symbol} {int(futures_ltp)} CE
+Buy  {symbol} {int(futures_ltp + 200)} CE
+Sell {symbol} {int(futures_ltp)} PE
+Buy  {symbol} {int(futures_ltp - 200)} PE
 
-Max Profit: Net Premium Collected
-Max Loss: Strike Width - Premium
-Risk: ⚠️ MODERATE
-Best When: Price stays between {int(futures_ltp - 100)} and {int(futures_ltp + 100)}
+Max Profit: Premium collected
+Risk: MODERATE
+Best: Price stays {int(futures_ltp - 100)} to {int(futures_ltp + 100)}
             """)
             
-            st.markdown("#### Strategy 2: 🔒 Short Straddle (Advanced)")
-            st.code(f"""
-Setup:
-  Sell {symbol} {atm_info['atm_strike']} CE
-  Sell {symbol} {atm_info['atm_strike']} PE
+            st.markdown("#### Strategy 2: Short Straddle")
+            st.text(f"""
+Sell {symbol} {atm_info['atm_strike']} CE + PE
 
-Premium Collected: ₹{atm_info['atm_straddle_premium']:.2f}
-Max Profit: ₹{atm_info['atm_straddle_premium']:.2f}
-Max Loss: UNLIMITED
-Risk: ⚠️⚠️⚠️ HIGH (Use strict stops)
-Exit: If price moves ±₹{atm_info['atm_straddle_premium']*0.5:.2f} from ATM
+Premium: Rs {atm_info['atm_straddle_premium']:.2f}
+Risk: HIGH - Use stops
+Exit if price moves Rs {atm_info['atm_straddle_premium']*0.5:.2f}
             """)
-            
-            if dex_bias_val > 0:
-                st.markdown("#### Strategy 3: 📈 Bull Call Spread (DEX confirms bullish)")
-                st.code(f"""
-Setup:
-  Buy  {symbol} {int(futures_ltp)} CE
-  Sell {symbol} {int(futures_ltp + 100)} CE
-
-Max Profit: Strike Width (100) - Premium Paid
-Max Loss: Premium Paid
-Risk: ✅ LOW-MODERATE
-Target: {int(futures_ltp + 100)}
-                """)
         
-        # SCENARIO 2: Negative GEX
+        # Negative GEX
         elif gex_bias_val < -50:
-            st.error("### 🔴 SCENARIO: Negative GEX (High Volatility Expected)")
+            st.error("### 🔴 Negative GEX - High Volatility")
             
-            st.markdown("#### Strategy 1: 🎭 Long Straddle")
-            st.code(f"""
-Setup:
-  Buy {symbol} {atm_info['atm_strike']} CE
-  Buy {symbol} {atm_info['atm_strike']} PE
+            st.markdown("#### Strategy: Long Straddle")
+            st.text(f"""
+Buy {symbol} {atm_info['atm_strike']} CE + PE
 
-Total Cost: ₹{atm_info['atm_straddle_premium']:.2f}
-Upper Breakeven: {atm_info['atm_strike'] + atm_info['atm_straddle_premium']:.0f}
-Lower Breakeven: {atm_info['atm_strike'] - atm_info['atm_straddle_premium']:.0f}
-Max Profit: UNLIMITED
-Max Loss: ₹{atm_info['atm_straddle_premium']:.2f}
-Risk: ⚠️ HIGH (Needs big move)
+Cost: Rs {atm_info['atm_straddle_premium']:.2f}
+Upper BE: {atm_info['atm_strike'] + atm_info['atm_straddle_premium']:.0f}
+Lower BE: {atm_info['atm_strike'] - atm_info['atm_straddle_premium']:.0f}
+Risk: HIGH - Needs big move
             """)
-            
-            if dex_bias_val < -20:
-                st.markdown("#### Strategy 2: 🐻 Bear Put Spread (DEX confirms bearish)")
-                st.code(f"""
-Setup:
-  Buy  {symbol} {int(futures_ltp)} PE
-  Sell {symbol} {int(futures_ltp - 200)} PE
-
-Max Profit: Strike Width (200) - Premium Paid
-Max Loss: Premium Paid
-Risk: ✅ MODERATE
-Target: {int(futures_ltp - 200)}
-                """)
-            
-            elif dex_bias_val > 20:
-                st.markdown("#### Strategy 2: 🚀 Long Call (Volatile upside)")
-                st.code(f"""
-Setup:
-  Buy {symbol} {int(futures_ltp + 100)} CE (OTM)
-
-Max Profit: UNLIMITED
-Max Loss: Premium Paid
-Risk: ⚠️ HIGH
-Target: {int(futures_ltp + 300)}+
-                """)
         
-        # SCENARIO 3: Neutral
+        # Neutral
         else:
-            st.warning("### ⚖️ SCENARIO: Neutral/Mixed Signals")
+            st.warning("### ⚖️ Neutral/Mixed Signals")
             
             if dex_bias_val > 20:
-                st.markdown("#### Strategy 1: 📈 Bull Call Spread (Follow DEX)")
-                st.code(f"""
-Setup:
-  Buy  {symbol} {int(futures_ltp)} CE
-  Sell {symbol} {int(futures_ltp + 100)} CE
-
-Risk: ✅ MODERATE
+                st.markdown("#### Bull Call Spread")
+                st.text(f"""
+Buy  {symbol} {int(futures_ltp)} CE
+Sell {symbol} {int(futures_ltp + 100)} CE
+Risk: MODERATE
                 """)
-            
             elif dex_bias_val < -20:
-                st.markdown("#### Strategy 1: 📉 Bear Put Spread (Follow DEX)")
-                st.code(f"""
-Setup:
-  Buy  {symbol} {int(futures_ltp)} PE
-  Sell {symbol} {int(futures_ltp - 100)} PE
-
-Risk: ✅ MODERATE
+                st.markdown("#### Bear Put Spread")
+                st.text(f"""
+Buy  {symbol} {int(futures_ltp)} PE
+Sell {symbol} {int(futures_ltp - 100)} PE
+Risk: MODERATE
                 """)
-            
             else:
-                st.info("#### ⏸️ WAIT FOR CLARITY")
-                st.markdown("""
-**Current Conditions:**
-- Mixed GEX and DEX signals
-- No clear directional edge
-- High uncertainty
-
-**Recommended Action:**
-- Stay in cash or very small positions
-- Wait for clearer setup (GEX > 50 or < -50)
-- Monitor for changes every 1-3 hours
-                """)
+                st.info("⏸️ **Wait for Clarity** - Mixed signals, stay cautious")
         
-        # Common Risk Management
         st.markdown("---")
-        st.markdown("### ⚠️ Universal Risk Management Rules")
+        st.markdown("### ⚠️ Risk Rules")
         st.markdown("""
-1. **Position Sizing**: Never risk more than 2% of capital per trade
-2. **Stop Loss**: Always use defined risk strategies or strict stops
-3. **Time Decay**: 
-   - Selling strategies: Theta works FOR you
-   - Buying strategies: Monitor theta closely, don't hold till expiry
-4. **Exit Rules**:
-   - Take profit at 50-70% of max profit for spreads
-   - Use trailing stops for long options (20-30% of unrealized profit)
-   - Exit immediately if GEX/DEX bias changes significantly
-5. **Gamma Flip Zones**: 
-   - Avoid tight stop losses near these zones
-   - High volatility and rapid moves expected
-   - Consider wider stops or avoid trading near flip zones
-6. **Monitoring**:
-   - Check GEX+DEX every 1-3 hours during market
-   - Watch for OI changes and flow metrics
-   - If combined bias flips, reassess positions immediately
+1. Max 2% capital per trade
+2. Always use stops
+3. Monitor theta decay
+4. Take profit at 50-70% max
+5. Avoid tight stops near gamma flip zones
         """)
         
         if user_tier != "premium":
-            st.markdown("---")
-            st.info("🔒 **Premium Features:** Backtested strategy parameters, win rates, and historical performance analysis coming soon!")
+            st.info("🔒 Premium: Backtested parameters coming soon")
     
     else:
-        st.warning("Flow metrics or ATM data unavailable for strategy generation")
+        st.warning("Metrics unavailable")
 
 # ============================================================================
-# FOOTER WITH IST TIME
+# FOOTER
 # ============================================================================
 
 st.markdown("---")
@@ -719,7 +628,7 @@ col1, col2, col3, col4 = st.columns(4)
 ist_time = get_ist_time()
 
 with col1:
-    st.info(f"⏰ IST: {ist_time.strftime('%H:%M:%S')}")
+    st.info(f"⏰ {ist_time.strftime('%H:%M:%S')} IST")
 
 with col2:
     st.info(f"📅 {ist_time.strftime('%d %b %Y')}")
@@ -729,14 +638,14 @@ with col3:
 
 with col4:
     if gamma_flip_zones:
-        st.warning(f"⚡ {len(gamma_flip_zones)} Flip Zone(s)")
+        st.warning(f"⚡ {len(gamma_flip_zones)} Flip(s)")
     else:
-        st.success("✅ No Flip Zones")
+        st.success("✅ No Flips")
 
-st.markdown(f"**💡 Subscribe to NYZTrade on YouTube! | Data Source: {fetch_method}**")
+st.markdown(f"**💡 NYZTrade YouTube | Data: {fetch_method}**")
 
 # ============================================================================
-# AUTO-REFRESH WITH COUNTDOWN
+# AUTO-REFRESH
 # ============================================================================
 
 if auto_refresh and user_tier == "premium":
@@ -747,18 +656,3 @@ if auto_refresh and user_tier == "premium":
     else:
         time.sleep(1)
         st.rerun()
-```
-
----
-
-## **Update requirements.txt:**
-
-Add `pytz` for Indian time:
-```
-streamlit
-pandas
-numpy
-plotly
-scipy
-requests
-pytz
