@@ -1,594 +1,753 @@
-#!/usr/bin/env python3
 """
 ================================================================================
-NYZTrade - Automated GEX/DEX Data Collector
+NYZTrade - Live Data Fetcher Module
 ================================================================================
-This script runs independently in the background to collect and store
-GEX/DEX data at regular intervals. No browser or login required.
+Robust NSE data fetching with multiple fallback methods:
+1. Direct NSE API with proper session handling
+2. Groww.in futures price
+3. Multiple retry mechanisms
+4. Detailed status reporting
 
-Usage:
-    python data_collector.py                    # Run once
-    python data_collector.py --continuous       # Run continuously
-    python data_collector.py --interval 5       # Custom interval (minutes)
-
-Schedule with cron (Linux/Mac):
-    */3 9-16 * * 1-5 /usr/bin/python3 /path/to/data_collector.py
-
-Schedule with Task Scheduler (Windows):
-    Create task to run every 3 minutes during market hours
+Author: NYZTrade
 ================================================================================
 """
 
-import sqlite3
+import requests
+import pandas as pd
+import numpy as np
+import re
 import json
-import os
-import sys
-import time
-import argparse
 from datetime import datetime, timedelta
-import logging
+from scipy.stats import norm
+import warnings
+import time
+import random
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('data_collector.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Try importing the calculator
-try:
-    from gex_calculator import EnhancedGEXDEXCalculator, calculate_dual_gex_dex_flow, detect_gamma_flip_zones
-    CALCULATOR_AVAILABLE = True
-except ImportError as e:
-    logger.error(f"Cannot import gex_calculator: {e}")
-    CALCULATOR_AVAILABLE = False
+warnings.filterwarnings('ignore')
 
 
 # ============================================================================
-# DATABASE CONFIGURATION
+# USER AGENT ROTATION
 # ============================================================================
 
-DATABASE_FILE = "gex_dex_history.db"
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+]
 
-# Symbols to collect
-SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-
-# Default settings
-DEFAULT_STRIKES_RANGE = 12
-DEFAULT_EXPIRY_INDEX = 0
-
-
-# ============================================================================
-# DATABASE SETUP
-# ============================================================================
-
-def init_database():
-    """Initialize SQLite database with required tables"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    # Main snapshots table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME NOT NULL,
-            symbol TEXT NOT NULL,
-            futures_ltp REAL,
-            spot_price REAL,
-            fetch_method TEXT,
-            total_gex REAL,
-            total_dex REAL,
-            gex_bias TEXT,
-            dex_bias TEXT,
-            combined_bias TEXT,
-            atm_strike REAL,
-            atm_straddle_premium REAL,
-            pcr REAL,
-            expiry_date TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(timestamp, symbol)
-        )
-    """)
-    
-    # Strike-wise data table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS strike_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_id INTEGER NOT NULL,
-            strike REAL NOT NULL,
-            call_oi INTEGER,
-            put_oi INTEGER,
-            call_oi_change INTEGER,
-            put_oi_change INTEGER,
-            call_volume INTEGER,
-            put_volume INTEGER,
-            call_iv REAL,
-            put_iv REAL,
-            call_ltp REAL,
-            put_ltp REAL,
-            net_gex REAL,
-            net_dex REAL,
-            hedging_pressure REAL,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
-        )
-    """)
-    
-    # Flow metrics table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS flow_metrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_id INTEGER NOT NULL,
-            gex_near_total REAL,
-            gex_near_positive REAL,
-            gex_near_negative REAL,
-            dex_near_total REAL,
-            dex_near_positive REAL,
-            dex_near_negative REAL,
-            combined_signal REAL,
-            max_call_oi_strike REAL,
-            max_put_oi_strike REAL,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
-        )
-    """)
-    
-    # Gamma flip zones table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS gamma_flips (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_id INTEGER NOT NULL,
-            lower_strike REAL,
-            upper_strike REAL,
-            flip_type TEXT,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
-        )
-    """)
-    
-    # Create indexes for faster queries
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON snapshots(timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_symbol ON snapshots(symbol)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_strike_data_snapshot ON strike_data(snapshot_id)")
-    
-    conn.commit()
-    conn.close()
-    logger.info(f"Database initialized: {DATABASE_FILE}")
-
-
-def save_snapshot(symbol, df, futures_ltp, fetch_method, atm_info, flow_metrics, gamma_flips=None):
-    """Save a complete snapshot to database"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    try:
-        timestamp = datetime.now()
-        
-        # Calculate totals
-        total_gex = float(df['Net_GEX_B'].sum()) if 'Net_GEX_B' in df.columns else 0
-        total_dex = float(df['Net_DEX_B'].sum()) if 'Net_DEX_B' in df.columns else 0
-        
-        # Get biases
-        gex_bias = flow_metrics.get('gex_near_bias', 'N/A') if flow_metrics else 'N/A'
-        dex_bias = flow_metrics.get('dex_near_bias', 'N/A') if flow_metrics else 'N/A'
-        combined_bias = flow_metrics.get('combined_bias', 'N/A') if flow_metrics else 'N/A'
-        
-        # ATM info
-        atm_strike = atm_info.get('atm_strike', 0) if atm_info else 0
-        atm_straddle = atm_info.get('atm_straddle_premium', 0) if atm_info else 0
-        expiry_date = atm_info.get('expiry_date', '') if atm_info else ''
-        
-        # PCR
-        total_call_oi = df['Call_OI'].sum() if 'Call_OI' in df.columns else 0
-        total_put_oi = df['Put_OI'].sum() if 'Put_OI' in df.columns else 0
-        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-        
-        # Spot price (if available)
-        spot_price = atm_info.get('spot_price', futures_ltp) if atm_info else futures_ltp
-        
-        # Insert main snapshot
-        cursor.execute("""
-            INSERT OR REPLACE INTO snapshots 
-            (timestamp, symbol, futures_ltp, spot_price, fetch_method, total_gex, total_dex,
-             gex_bias, dex_bias, combined_bias, atm_strike, atm_straddle_premium, pcr, expiry_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            timestamp, symbol, futures_ltp, spot_price, fetch_method, total_gex, total_dex,
-            gex_bias, dex_bias, combined_bias, atm_strike, atm_straddle, pcr, expiry_date
-        ))
-        
-        snapshot_id = cursor.lastrowid
-        
-        # Insert strike-wise data
-        for _, row in df.iterrows():
-            cursor.execute("""
-                INSERT INTO strike_data 
-                (snapshot_id, strike, call_oi, put_oi, call_oi_change, put_oi_change,
-                 call_volume, put_volume, call_iv, put_iv, call_ltp, put_ltp,
-                 net_gex, net_dex, hedging_pressure)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                snapshot_id,
-                row.get('Strike', 0),
-                row.get('Call_OI', 0),
-                row.get('Put_OI', 0),
-                row.get('Call_OI_Change', 0),
-                row.get('Put_OI_Change', 0),
-                row.get('Call_Volume', 0),
-                row.get('Put_Volume', 0),
-                row.get('Call_IV', 0),
-                row.get('Put_IV', 0),
-                row.get('Call_LTP', 0),
-                row.get('Put_LTP', 0),
-                row.get('Net_GEX_B', 0),
-                row.get('Net_DEX_B', 0),
-                row.get('Hedging_Pressure', 0)
-            ))
-        
-        # Insert flow metrics
-        if flow_metrics:
-            cursor.execute("""
-                INSERT INTO flow_metrics 
-                (snapshot_id, gex_near_total, gex_near_positive, gex_near_negative,
-                 dex_near_total, dex_near_positive, dex_near_negative, combined_signal,
-                 max_call_oi_strike, max_put_oi_strike)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                snapshot_id,
-                flow_metrics.get('gex_near_total', 0),
-                flow_metrics.get('gex_near_positive', 0),
-                flow_metrics.get('gex_near_negative', 0),
-                flow_metrics.get('dex_near_total', 0),
-                flow_metrics.get('dex_near_positive', 0),
-                flow_metrics.get('dex_near_negative', 0),
-                flow_metrics.get('combined_signal', 0),
-                flow_metrics.get('max_call_oi_strike', 0),
-                flow_metrics.get('max_put_oi_strike', 0)
-            ))
-        
-        # Insert gamma flip zones
-        if gamma_flips:
-            for flip in gamma_flips:
-                cursor.execute("""
-                    INSERT INTO gamma_flips (snapshot_id, lower_strike, upper_strike, flip_type)
-                    VALUES (?, ?, ?, ?)
-                """, (
-                    snapshot_id,
-                    flip.get('lower_strike', 0),
-                    flip.get('upper_strike', 0),
-                    flip.get('flip_type', 'unknown')
-                ))
-        
-        conn.commit()
-        logger.info(f"✅ Saved snapshot for {symbol} at {timestamp.strftime('%H:%M:%S')} (ID: {snapshot_id})")
-        return snapshot_id
-        
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"❌ Failed to save snapshot for {symbol}: {e}")
-        return None
-    finally:
-        conn.close()
+def get_random_ua():
+    return random.choice(USER_AGENTS)
 
 
 # ============================================================================
-# DATA COLLECTION
+# BLACK-SCHOLES CALCULATOR
 # ============================================================================
 
-def collect_data_for_symbol(symbol, strikes_range=DEFAULT_STRIKES_RANGE, expiry_index=DEFAULT_EXPIRY_INDEX):
-    """Collect GEX/DEX data for a single symbol"""
-    if not CALCULATOR_AVAILABLE:
-        logger.error("Calculator not available")
-        return False
+class BlackScholesCalculator:
+    """Calculate option Greeks using Black-Scholes model"""
     
-    try:
-        calculator = EnhancedGEXDEXCalculator()
-        
-        # Fetch data
-        df, futures_ltp, fetch_method, atm_info = calculator.fetch_and_calculate_gex_dex(
-            symbol=symbol,
-            strikes_range=strikes_range,
-            expiry_index=expiry_index
-        )
-        
-        if df is None or df.empty:
-            logger.warning(f"No data received for {symbol}")
-            return False
-        
-        # Calculate flow metrics
+    @staticmethod
+    def calculate_d1(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0
         try:
-            flow_metrics = calculate_dual_gex_dex_flow(df, futures_ltp)
+            d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+            return d1
         except:
-            flow_metrics = None
-        
-        # Detect gamma flips
+            return 0
+
+    @staticmethod
+    def calculate_gamma(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0
         try:
-            gamma_flips = detect_gamma_flip_zones(df)
+            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
+            n_prime_d1 = norm.pdf(d1)
+            gamma = n_prime_d1 / (S * sigma * np.sqrt(T))
+            return gamma
         except:
-            gamma_flips = None
-        
-        # Save to database
-        snapshot_id = save_snapshot(symbol, df, futures_ltp, fetch_method, atm_info, flow_metrics, gamma_flips)
-        
-        return snapshot_id is not None
-        
-    except Exception as e:
-        logger.error(f"Error collecting data for {symbol}: {e}")
-        return False
+            return 0
 
-
-def collect_all_symbols():
-    """Collect data for all configured symbols"""
-    logger.info("=" * 60)
-    logger.info(f"Starting data collection at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    results = {}
-    for symbol in SYMBOLS:
-        success = collect_data_for_symbol(symbol)
-        results[symbol] = success
-        time.sleep(2)  # Small delay between symbols to avoid rate limiting
-    
-    success_count = sum(results.values())
-    logger.info(f"Collection complete: {success_count}/{len(SYMBOLS)} successful")
-    logger.info("=" * 60)
-    
-    return results
-
-
-def is_market_hours():
-    """Check if current time is within market hours (IST)"""
-    try:
-        import pytz
-        ist = pytz.timezone('Asia/Kolkata')
-        now = datetime.now(ist)
-    except:
-        # Fallback if pytz not available
-        now = datetime.now()
-    
-    # Market hours: 9:15 AM to 3:30 PM, Monday to Friday
-    if now.weekday() >= 5:  # Saturday or Sunday
-        return False
-    
-    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    
-    return market_open <= now <= market_close
-
-
-def run_continuous(interval_minutes=3, market_hours_only=True):
-    """Run data collection continuously at specified interval"""
-    logger.info(f"Starting continuous collection every {interval_minutes} minutes")
-    logger.info(f"Market hours only: {market_hours_only}")
-    
-    while True:
+    @staticmethod
+    def calculate_call_delta(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0
         try:
-            if market_hours_only and not is_market_hours():
-                logger.info("Outside market hours. Waiting...")
-                time.sleep(60)  # Check every minute
-                continue
+            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
+            return norm.cdf(d1)
+        except:
+            return 0
+
+    @staticmethod
+    def calculate_put_delta(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0
+        try:
+            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
+            return norm.cdf(d1) - 1
+        except:
+            return 0
+
+
+# ============================================================================
+# NSE DATA FETCHER - ROBUST VERSION
+# ============================================================================
+
+class RobustNSEFetcher:
+    """
+    Robust NSE Option Chain Fetcher with:
+    - Proper session/cookie handling
+    - User agent rotation
+    - Multiple retry attempts
+    - Detailed status reporting
+    """
+    
+    def __init__(self):
+        self.base_url = "https://www.nseindia.com"
+        self.option_chain_url = "https://www.nseindia.com/api/option-chain-indices"
+        self.session = None
+        self.cookies_valid = False
+        self.last_init_time = None
+        self.status_log = []
+        
+    def log_status(self, message, level="INFO"):
+        """Log status for debugging"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.status_log.append(f"[{timestamp}] [{level}] {message}")
+        if len(self.status_log) > 50:
+            self.status_log = self.status_log[-50:]
+    
+    def get_status_log(self):
+        """Get recent status messages"""
+        return self.status_log[-10:]
+    
+    def create_session(self):
+        """Create new session with fresh cookies"""
+        self.session = requests.Session()
+        
+        headers = {
+            'User-Agent': get_random_ua(),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'max-age=0',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        self.session.headers.update(headers)
+        return self.session
+    
+    def initialize_session(self, max_retries=3):
+        """Initialize session with NSE website to get cookies"""
+        
+        for attempt in range(max_retries):
+            try:
+                self.log_status(f"Initializing NSE session (attempt {attempt + 1}/{max_retries})")
+                
+                # Create fresh session
+                self.create_session()
+                
+                # First, visit the main page
+                response = self.session.get(
+                    self.base_url,
+                    timeout=15,
+                    allow_redirects=True
+                )
+                
+                if response.status_code == 200:
+                    self.log_status(f"Main page OK, cookies: {len(self.session.cookies)}")
+                    
+                    # Small delay to mimic human behavior
+                    time.sleep(0.5 + random.random())
+                    
+                    # Visit option chain page to get additional cookies
+                    oc_page = self.session.get(
+                        f"{self.base_url}/option-chain",
+                        timeout=15
+                    )
+                    
+                    if oc_page.status_code == 200:
+                        self.log_status("Option chain page OK")
+                        
+                        # Update headers for API calls
+                        self.session.headers.update({
+                            'Accept': 'application/json, text/plain, */*',
+                            'Referer': 'https://www.nseindia.com/option-chain',
+                            'X-Requested-With': 'XMLHttpRequest',
+                        })
+                        
+                        self.cookies_valid = True
+                        self.last_init_time = datetime.now()
+                        self.log_status("Session initialized successfully", "SUCCESS")
+                        return True, "Session initialized"
+                
+                self.log_status(f"Attempt {attempt + 1} failed: Status {response.status_code}", "WARNING")
+                time.sleep(1 + random.random())
+                
+            except requests.exceptions.Timeout:
+                self.log_status(f"Attempt {attempt + 1}: Timeout", "WARNING")
+            except requests.exceptions.ConnectionError as e:
+                self.log_status(f"Attempt {attempt + 1}: Connection error", "WARNING")
+            except Exception as e:
+                self.log_status(f"Attempt {attempt + 1}: {str(e)[:50]}", "ERROR")
+        
+        self.cookies_valid = False
+        return False, "Failed to initialize session after all retries"
+    
+    def fetch_option_chain(self, symbol="NIFTY", max_retries=3):
+        """Fetch option chain data with retries"""
+        
+        # Check if session needs refresh (every 3 minutes)
+        if self.last_init_time:
+            elapsed = (datetime.now() - self.last_init_time).total_seconds()
+            if elapsed > 180:
+                self.cookies_valid = False
+        
+        # Initialize if needed
+        if not self.cookies_valid or self.session is None:
+            success, msg = self.initialize_session()
+            if not success:
+                return None, msg
+        
+        url = f"{self.option_chain_url}?symbol={symbol}"
+        
+        for attempt in range(max_retries):
+            try:
+                self.log_status(f"Fetching {symbol} option chain (attempt {attempt + 1})")
+                
+                response = self.session.get(url, timeout=15)
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        
+                        if 'records' in data and 'data' in data['records']:
+                            records = data['records']
+                            strikes_count = len(records.get('data', []))
+                            spot = records.get('underlyingValue', 0)
+                            
+                            self.log_status(f"SUCCESS: {symbol} - {strikes_count} strikes, Spot: {spot}", "SUCCESS")
+                            return data, None
+                        else:
+                            self.log_status("Invalid response format", "WARNING")
+                            
+                    except json.JSONDecodeError:
+                        self.log_status("JSON decode error", "WARNING")
+                
+                elif response.status_code == 401:
+                    self.log_status("401 Unauthorized - Refreshing session", "WARNING")
+                    self.cookies_valid = False
+                    success, msg = self.initialize_session()
+                    if not success:
+                        return None, msg
+                
+                elif response.status_code == 403:
+                    self.log_status("403 Forbidden - IP might be blocked", "ERROR")
+                    return None, "NSE blocked request (403). Try running locally."
+                
+                else:
+                    self.log_status(f"HTTP {response.status_code}", "WARNING")
+                
+                time.sleep(1 + random.random())
+                
+            except requests.exceptions.Timeout:
+                self.log_status(f"Timeout on attempt {attempt + 1}", "WARNING")
+            except Exception as e:
+                self.log_status(f"Error: {str(e)[:50]}", "ERROR")
+        
+        return None, f"Failed to fetch {symbol} after {max_retries} attempts"
+
+
+# ============================================================================
+# GROWW FUTURES FETCHER
+# ============================================================================
+
+class GrowwFuturesFetcher:
+    """Fetch futures price from Groww.in"""
+    
+    def __init__(self):
+        self.headers = {
+            'User-Agent': get_random_ua(),
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Origin': 'https://groww.in',
+            'Referer': 'https://groww.in/derivatives',
+        }
+    
+    def get_futures_price(self, symbol, spot_price=None):
+        """
+        Fetch futures price from Groww.in
+        Returns: (price, method) or (None, error)
+        """
+        
+        # Method 1: Groww derivatives API
+        price = self._try_groww_api(symbol)
+        if price:
+            return price, "Groww API"
+        
+        # Method 2: Groww search API
+        price = self._try_groww_search(symbol)
+        if price:
+            return price, "Groww Search"
+        
+        # Method 3: Calculate from spot (if provided)
+        if spot_price:
+            # Add typical futures premium (~0.05-0.1%)
+            futures = spot_price * 1.0005
+            return round(futures, 2), "Spot+Premium"
+        
+        return None, "Groww fetch failed"
+    
+    def _try_groww_api(self, symbol):
+        """Try Groww derivatives API"""
+        try:
+            symbol_map = {
+                'NIFTY': 'NIFTY',
+                'BANKNIFTY': 'BANKNIFTY',
+                'FINNIFTY': 'FINNIFTY',
+                'MIDCPNIFTY': 'MIDCPNIFTY'
+            }
             
-            collect_all_symbols()
+            groww_symbol = symbol_map.get(symbol, symbol)
             
-            logger.info(f"Sleeping for {interval_minutes} minutes...")
-            time.sleep(interval_minutes * 60)
+            # Try futures contracts endpoint
+            url = f"https://groww.in/v1/api/stocks_fo_data/v1/derivatives/futures/contracts/{groww_symbol}"
             
-        except KeyboardInterrupt:
-            logger.info("Stopped by user")
-            break
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if isinstance(data, list) and len(data) > 0:
+                    for contract in data:
+                        if 'ltp' in contract:
+                            return float(contract['ltp'])
+                        if 'lastPrice' in contract:
+                            return float(contract['lastPrice'])
+                
+                if isinstance(data, dict):
+                    if 'ltp' in data:
+                        return float(data['ltp'])
+            
+            return None
+        except:
+            return None
+    
+    def _try_groww_search(self, symbol):
+        """Try Groww search endpoint"""
+        try:
+            url = f"https://groww.in/v1/api/search/v1/entity?page=0&query={symbol}%20FUT&size=10"
+            
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                content = data.get('content', [])
+                for item in content:
+                    if 'FUT' in item.get('title', '').upper():
+                        ltp = item.get('ltp') or item.get('lastPrice')
+                        if ltp:
+                            return float(ltp)
+            
+            return None
+        except:
+            return None
+
+
+# ============================================================================
+# MAIN CALCULATOR
+# ============================================================================
+
+class LiveGEXDEXCalculator:
+    """
+    Live GEX + DEX Calculator with:
+    - Robust NSE fetching
+    - Groww futures price
+    - Proper error handling
+    - Status reporting
+    """
+    
+    def __init__(self):
+        self.nse_fetcher = RobustNSEFetcher()
+        self.groww_fetcher = GrowwFuturesFetcher()
+        self.bs_calc = BlackScholesCalculator()
+        self.risk_free_rate = 0.07
+        self.last_error = None
+        self.data_source = "Unknown"
+    
+    def get_contract_specs(self, symbol):
+        """Get contract specifications"""
+        specs = {
+            'NIFTY': {'lot_size': 25, 'strike_interval': 50},
+            'BANKNIFTY': {'lot_size': 15, 'strike_interval': 100},
+            'FINNIFTY': {'lot_size': 40, 'strike_interval': 50},
+            'MIDCPNIFTY': {'lot_size': 75, 'strike_interval': 25}
+        }
+        return specs.get(symbol, specs['NIFTY'])
+    
+    def calculate_time_to_expiry(self, expiry_str):
+        """Calculate time to expiry in years"""
+        try:
+            expiry = datetime.strptime(expiry_str, "%d-%b-%Y")
+            now = datetime.now()
+            
+            # Add time to end of day
+            expiry = expiry.replace(hour=15, minute=30)
+            
+            diff = expiry - now
+            days = diff.total_seconds() / (24 * 3600)
+            T = max(days / 365, 0.5/365)  # Minimum half day
+            return T, max(int(days), 1)
+        except:
+            return 7/365, 7
+    
+    def get_status_log(self):
+        """Get status log from NSE fetcher"""
+        return self.nse_fetcher.get_status_log()
+    
+    def fetch_live_data(self, symbol="NIFTY", strikes_range=12, expiry_index=0):
+        """
+        Fetch live GEX/DEX data
+        
+        Returns:
+            tuple: (df, futures_ltp, fetch_method, atm_info, error_message)
+        """
+        
+        self.last_error = None
+        
+        # Step 1: Fetch NSE option chain
+        data, error = self.nse_fetcher.fetch_option_chain(symbol)
+        
+        if error or not data:
+            self.last_error = error or "No data received"
+            self.data_source = "Failed"
+            return None, None, None, None, self.last_error
+        
+        try:
+            records = data['records']
+            spot_price = records.get('underlyingValue', 0)
+            timestamp = records.get('timestamp', datetime.now().strftime('%d-%b-%Y %H:%M:%S'))
+            expiry_dates = records.get('expiryDates', [])
+            
+            if not expiry_dates or spot_price == 0:
+                self.last_error = "Invalid data: No expiries or spot price"
+                return None, None, None, None, self.last_error
+            
+            # Select expiry
+            selected_expiry = expiry_dates[min(expiry_index, len(expiry_dates) - 1)]
+            T, days_to_expiry = self.calculate_time_to_expiry(selected_expiry)
+            
+            # Step 2: Get futures price
+            futures_ltp, fetch_method = self.groww_fetcher.get_futures_price(symbol, spot_price)
+            
+            if not futures_ltp:
+                # Fallback: Use spot + premium
+                futures_ltp = spot_price * 1.0003
+                fetch_method = "Spot+Premium"
+            
+            self.data_source = f"NSE Live + {fetch_method}"
+            
+            # Get specs
+            specs = self.get_contract_specs(symbol)
+            lot_size = specs['lot_size']
+            strike_interval = specs['strike_interval']
+            
+            # Process strikes
+            all_strikes = []
+            processed = set()
+            atm_strike = None
+            min_diff = float('inf')
+            atm_call_premium = 0
+            atm_put_premium = 0
+            
+            for item in records.get('data', []):
+                if item.get('expiryDate') != selected_expiry:
+                    continue
+                
+                strike = item.get('strikePrice', 0)
+                if strike == 0 or strike in processed:
+                    continue
+                
+                processed.add(strike)
+                
+                # Filter by range
+                distance = abs(strike - futures_ltp) / strike_interval
+                if distance > strikes_range:
+                    continue
+                
+                ce = item.get('CE', {})
+                pe = item.get('PE', {})
+                
+                # Extract data
+                call_oi = ce.get('openInterest', 0) or 0
+                put_oi = pe.get('openInterest', 0) or 0
+                call_oi_change = ce.get('changeinOpenInterest', 0) or 0
+                put_oi_change = pe.get('changeinOpenInterest', 0) or 0
+                call_volume = ce.get('totalTradedVolume', 0) or 0
+                put_volume = pe.get('totalTradedVolume', 0) or 0
+                call_iv = ce.get('impliedVolatility', 0) or 15
+                put_iv = pe.get('impliedVolatility', 0) or 15
+                call_ltp = ce.get('lastPrice', 0) or 0
+                put_ltp = pe.get('lastPrice', 0) or 0
+                
+                # Track ATM
+                diff = abs(strike - futures_ltp)
+                if diff < min_diff:
+                    min_diff = diff
+                    atm_strike = strike
+                    atm_call_premium = call_ltp
+                    atm_put_premium = put_ltp
+                
+                # Calculate Greeks
+                call_iv_dec = max(call_iv / 100, 0.05)
+                put_iv_dec = max(put_iv / 100, 0.05)
+                
+                call_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
+                put_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
+                call_delta = self.bs_calc.calculate_call_delta(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
+                put_delta = self.bs_calc.calculate_put_delta(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
+                
+                # GEX calculation (in Billions)
+                gex_mult = futures_ltp * futures_ltp * lot_size / 1_000_000_000
+                call_gex = call_oi * call_gamma * gex_mult
+                put_gex = -put_oi * put_gamma * gex_mult
+                
+                # DEX calculation (in Billions)
+                dex_mult = futures_ltp * lot_size / 1_000_000_000
+                call_dex = call_oi * call_delta * dex_mult
+                put_dex = put_oi * put_delta * dex_mult
+                
+                all_strikes.append({
+                    'Strike': strike,
+                    'Call_OI': call_oi,
+                    'Put_OI': put_oi,
+                    'Call_OI_Change': call_oi_change,
+                    'Put_OI_Change': put_oi_change,
+                    'Call_Volume': call_volume,
+                    'Put_Volume': put_volume,
+                    'Call_IV': call_iv,
+                    'Put_IV': put_iv,
+                    'Call_LTP': call_ltp,
+                    'Put_LTP': put_ltp,
+                    'Call_Gamma': call_gamma,
+                    'Put_Gamma': put_gamma,
+                    'Call_Delta': call_delta,
+                    'Put_Delta': put_delta,
+                    'Call_GEX': call_gex,
+                    'Put_GEX': put_gex,
+                    'Net_GEX': call_gex + put_gex,
+                    'Call_DEX': call_dex,
+                    'Put_DEX': put_dex,
+                    'Net_DEX': call_dex + put_dex,
+                })
+            
+            if not all_strikes:
+                self.last_error = "No strikes found for selected expiry"
+                return None, None, None, None, self.last_error
+            
+            # Create DataFrame
+            df = pd.DataFrame(all_strikes).sort_values('Strike').reset_index(drop=True)
+            
+            # Add _B suffix columns for compatibility
+            for col in ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_DEX', 'Put_DEX', 'Net_DEX']:
+                df[f'{col}_B'] = df[col]
+            
+            df['Total_Volume'] = df['Call_Volume'] + df['Put_Volume']
+            df['Total_OI'] = df['Call_OI'] + df['Put_OI']
+            
+            # Hedging Pressure
+            max_gex = df['Net_GEX_B'].abs().max()
+            df['Hedging_Pressure'] = (df['Net_GEX_B'] / max_gex * 100) if max_gex > 0 else 0
+            
+            # ATM info
+            atm_info = {
+                'atm_strike': atm_strike or df.iloc[len(df)//2]['Strike'],
+                'atm_call_premium': atm_call_premium,
+                'atm_put_premium': atm_put_premium,
+                'atm_straddle_premium': atm_call_premium + atm_put_premium,
+                'spot_price': spot_price,
+                'expiry_date': selected_expiry,
+                'days_to_expiry': days_to_expiry,
+                'timestamp': timestamp,
+                'expiry_index': expiry_index,
+                'all_expiries': expiry_dates[:5]  # First 5 expiries
+            }
+            
+            return df, futures_ltp, self.data_source, atm_info, None
+            
         except Exception as e:
-            logger.error(f"Error in continuous loop: {e}")
-            time.sleep(60)  # Wait a minute before retrying
+            self.last_error = f"Processing error: {str(e)}"
+            return None, None, None, None, self.last_error
 
 
 # ============================================================================
-# DATABASE QUERY FUNCTIONS (for dashboard to use)
+# FLOW METRICS - VOLATILITY TERMINOLOGY
 # ============================================================================
 
-def get_available_dates(symbol=None):
-    """Get list of dates with available data"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+def calculate_flow_metrics(df, futures_ltp):
+    """
+    Calculate GEX/DEX flow metrics with volatility terminology
     
-    if symbol:
-        cursor.execute("""
-            SELECT DISTINCT DATE(timestamp) as date 
-            FROM snapshots 
-            WHERE symbol = ?
-            ORDER BY date DESC
-        """, (symbol,))
-    else:
-        cursor.execute("""
-            SELECT DISTINCT DATE(timestamp) as date 
-            FROM snapshots 
-            ORDER BY date DESC
-        """)
+    Positive GEX = Volatility Dampening
+    Negative GEX = Volatility Amplifying
+    """
     
-    dates = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return dates
-
-
-def get_snapshots_for_date(symbol, date):
-    """Get all snapshots for a specific symbol and date"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    df_unique = df.drop_duplicates(subset=['Strike']).sort_values('Strike').reset_index(drop=True)
     
-    cursor.execute("""
-        SELECT id, timestamp, futures_ltp, total_gex, total_dex, gex_bias, dex_bias,
-               combined_bias, atm_strike, atm_straddle_premium, pcr
-        FROM snapshots 
-        WHERE symbol = ? AND DATE(timestamp) = ?
-        ORDER BY timestamp ASC
-    """, (symbol, date))
+    # Near-term GEX (5 positive + 5 negative closest to spot)
+    pos_gex = df_unique[df_unique['Net_GEX_B'] > 0].copy()
+    if len(pos_gex) > 0:
+        pos_gex['Dist'] = abs(pos_gex['Strike'] - futures_ltp)
+        pos_gex = pos_gex.nsmallest(5, 'Dist')
     
-    columns = ['id', 'timestamp', 'futures_ltp', 'total_gex', 'total_dex', 'gex_bias',
-               'dex_bias', 'combined_bias', 'atm_strike', 'atm_straddle_premium', 'pcr']
+    neg_gex = df_unique[df_unique['Net_GEX_B'] < 0].copy()
+    if len(neg_gex) > 0:
+        neg_gex['Dist'] = abs(neg_gex['Strike'] - futures_ltp)
+        neg_gex = neg_gex.nsmallest(5, 'Dist')
     
-    rows = cursor.fetchall()
-    conn.close()
+    gex_near_pos = float(pos_gex['Net_GEX_B'].sum()) if len(pos_gex) > 0 else 0
+    gex_near_neg = float(neg_gex['Net_GEX_B'].sum()) if len(neg_gex) > 0 else 0
+    gex_near_total = gex_near_pos + gex_near_neg
     
-    return [dict(zip(columns, row)) for row in rows]
-
-
-def get_strike_data(snapshot_id):
-    """Get strike-wise data for a specific snapshot"""
-    conn = sqlite3.connect(DATABASE_FILE)
+    # Total GEX
+    gex_total = float(df_unique['Net_GEX_B'].sum())
     
-    import pandas as pd
-    df = pd.read_sql_query("""
-        SELECT strike as Strike, call_oi as Call_OI, put_oi as Put_OI,
-               call_oi_change as Call_OI_Change, put_oi_change as Put_OI_Change,
-               call_volume as Call_Volume, put_volume as Put_Volume,
-               call_iv as Call_IV, put_iv as Put_IV,
-               call_ltp as Call_LTP, put_ltp as Put_LTP,
-               net_gex as Net_GEX_B, net_dex as Net_DEX_B,
-               hedging_pressure as Hedging_Pressure
-        FROM strike_data 
-        WHERE snapshot_id = ?
-        ORDER BY strike ASC
-    """, conn, params=(snapshot_id,))
+    # DEX flow (strikes above/below spot)
+    above = df_unique[df_unique['Strike'] > futures_ltp].head(5)
+    below = df_unique[df_unique['Strike'] < futures_ltp].tail(5)
     
-    conn.close()
-    return df
-
-
-def get_flow_metrics(snapshot_id):
-    """Get flow metrics for a specific snapshot"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    dex_near_pos = float(above['Net_DEX_B'].sum()) if len(above) > 0 else 0
+    dex_near_neg = float(below['Net_DEX_B'].sum()) if len(below) > 0 else 0
+    dex_near_total = dex_near_pos + dex_near_neg
     
-    cursor.execute("""
-        SELECT * FROM flow_metrics WHERE snapshot_id = ?
-    """, (snapshot_id,))
+    # Total DEX
+    dex_total = float(df_unique['Net_DEX_B'].sum())
     
-    row = cursor.fetchone()
-    conn.close()
+    # Key levels
+    max_call_oi_strike = float(df_unique.loc[df_unique['Call_OI'].idxmax(), 'Strike'])
+    max_put_oi_strike = float(df_unique.loc[df_unique['Put_OI'].idxmax(), 'Strike'])
     
-    if row:
-        columns = ['id', 'snapshot_id', 'gex_near_total', 'gex_near_positive', 'gex_near_negative',
-                   'dex_near_total', 'dex_near_positive', 'dex_near_negative', 'combined_signal',
-                   'max_call_oi_strike', 'max_put_oi_strike']
-        return dict(zip(columns, row))
-    return None
-
-
-def get_intraday_history(symbol, date):
-    """Get intraday price and GEX history for charting"""
-    conn = sqlite3.connect(DATABASE_FILE)
+    # PCR
+    total_call_oi = df_unique['Call_OI'].sum()
+    total_put_oi = df_unique['Put_OI'].sum()
+    pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1
     
-    import pandas as pd
-    df = pd.read_sql_query("""
-        SELECT timestamp, futures_ltp, total_gex, total_dex, gex_bias, pcr
-        FROM snapshots 
-        WHERE symbol = ? AND DATE(timestamp) = ?
-        ORDER BY timestamp ASC
-    """, conn, params=(symbol, date))
-    
-    conn.close()
-    return df
-
-
-def get_database_stats():
-    """Get database statistics"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    stats = {}
-    
-    # Total snapshots
-    cursor.execute("SELECT COUNT(*) FROM snapshots")
-    stats['total_snapshots'] = cursor.fetchone()[0]
-    
-    # Snapshots by symbol
-    cursor.execute("SELECT symbol, COUNT(*) FROM snapshots GROUP BY symbol")
-    stats['by_symbol'] = dict(cursor.fetchall())
-    
-    # Date range
-    cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM snapshots")
-    row = cursor.fetchone()
-    stats['first_snapshot'] = row[0]
-    stats['last_snapshot'] = row[1]
-    
-    # Database size
-    stats['db_size_mb'] = os.path.getsize(DATABASE_FILE) / (1024 * 1024) if os.path.exists(DATABASE_FILE) else 0
-    
-    conn.close()
-    return stats
-
-
-def cleanup_old_data(days_to_keep=30):
-    """Remove data older than specified days"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-    
-    # Get snapshot IDs to delete
-    cursor.execute("SELECT id FROM snapshots WHERE timestamp < ?", (cutoff_date,))
-    old_ids = [row[0] for row in cursor.fetchall()]
-    
-    if old_ids:
-        # Delete related data
-        cursor.execute(f"DELETE FROM strike_data WHERE snapshot_id IN ({','.join('?' * len(old_ids))})", old_ids)
-        cursor.execute(f"DELETE FROM flow_metrics WHERE snapshot_id IN ({','.join('?' * len(old_ids))})", old_ids)
-        cursor.execute(f"DELETE FROM gamma_flips WHERE snapshot_id IN ({','.join('?' * len(old_ids))})", old_ids)
-        cursor.execute(f"DELETE FROM snapshots WHERE id IN ({','.join('?' * len(old_ids))})", old_ids)
-        
-        conn.commit()
-        logger.info(f"Cleaned up {len(old_ids)} old snapshots")
-    
-    # Vacuum database to reclaim space
-    cursor.execute("VACUUM")
-    conn.close()
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description='NYZTrade GEX/DEX Data Collector')
-    parser.add_argument('--continuous', '-c', action='store_true', help='Run continuously')
-    parser.add_argument('--interval', '-i', type=int, default=3, help='Collection interval in minutes')
-    parser.add_argument('--symbol', '-s', type=str, help='Collect only specific symbol')
-    parser.add_argument('--all-hours', '-a', action='store_true', help='Collect outside market hours too')
-    parser.add_argument('--stats', action='store_true', help='Show database statistics')
-    parser.add_argument('--cleanup', type=int, help='Cleanup data older than N days')
-    
-    args = parser.parse_args()
-    
-    # Initialize database
-    init_database()
-    
-    # Show stats
-    if args.stats:
-        stats = get_database_stats()
-        print("\n📊 Database Statistics:")
-        print(f"   Total Snapshots: {stats['total_snapshots']}")
-        print(f"   By Symbol: {stats['by_symbol']}")
-        print(f"   First: {stats['first_snapshot']}")
-        print(f"   Last: {stats['last_snapshot']}")
-        print(f"   Size: {stats['db_size_mb']:.2f} MB")
-        return
-    
-    # Cleanup
-    if args.cleanup:
-        cleanup_old_data(args.cleanup)
-        return
-    
-    # Collect data
-    if args.continuous:
-        run_continuous(
-            interval_minutes=args.interval,
-            market_hours_only=not args.all_hours
-        )
-    else:
-        if args.symbol:
-            collect_data_for_symbol(args.symbol)
+    # Bias determination with VOLATILITY terminology
+    def get_gex_bias(val):
+        if val > 100:
+            return "🟢 STRONG DAMPENING", "#00d4aa"
+        elif val > 0:
+            return "🟢 DAMPENING", "#55efc4"
+        elif val > -100:
+            return "🔴 AMPLIFYING", "#ff6b6b"
         else:
-            collect_all_symbols()
+            return "🔴 STRONG AMPLIFYING", "#e74c3c"
+    
+    def get_dex_bias(val):
+        if val > 50:
+            return "🟢 STRONG BULLISH", "#00d4aa"
+        elif val > 0:
+            return "🟢 BULLISH", "#55efc4"
+        elif val > -50:
+            return "🔴 BEARISH", "#ff6b6b"
+        else:
+            return "🔴 STRONG BEARISH", "#e74c3c"
+    
+    gex_bias, gex_color = get_gex_bias(gex_near_total)
+    dex_bias, dex_color = get_dex_bias(dex_near_total)
+    
+    # Combined signal
+    combined = (gex_near_total + dex_near_total) / 2
+    if gex_near_total > 50 and dex_near_total > 20:
+        combined_bias = "🟢 DAMPENING + BULLISH"
+    elif gex_near_total > 50 and dex_near_total < -20:
+        combined_bias = "🟡 DAMPENING + BEARISH"
+    elif gex_near_total < -50 and dex_near_total > 20:
+        combined_bias = "⚡ AMPLIFYING + BULLISH"
+    elif gex_near_total < -50 and dex_near_total < -20:
+        combined_bias = "🔴 AMPLIFYING + BEARISH"
+    else:
+        combined_bias = "⚪ NEUTRAL"
+    
+    return {
+        'gex_near_total': gex_near_total,
+        'gex_near_positive': gex_near_pos,
+        'gex_near_negative': gex_near_neg,
+        'gex_total': gex_total,
+        'gex_bias': gex_bias,
+        'gex_color': gex_color,
+        'dex_near_total': dex_near_total,
+        'dex_total': dex_total,
+        'dex_bias': dex_bias,
+        'dex_color': dex_color,
+        'combined_signal': combined,
+        'combined_bias': combined_bias,
+        'max_call_oi_strike': max_call_oi_strike,
+        'max_put_oi_strike': max_put_oi_strike,
+        'pcr': pcr,
+        'total_call_oi': total_call_oi,
+        'total_put_oi': total_put_oi
+    }
 
+
+def detect_gamma_flips(df):
+    """Detect gamma flip zones"""
+    flips = []
+    df_sorted = df.sort_values('Strike').reset_index(drop=True)
+    
+    for i in range(len(df_sorted) - 1):
+        curr = df_sorted.loc[i, 'Net_GEX_B']
+        next_val = df_sorted.loc[i + 1, 'Net_GEX_B']
+        
+        if (curr > 0 and next_val < 0) or (curr < 0 and next_val > 0):
+            flips.append({
+                'lower': df_sorted.loc[i, 'Strike'],
+                'upper': df_sorted.loc[i + 1, 'Strike'],
+                'type': "DAMPENING → AMPLIFYING" if curr > 0 else "AMPLIFYING → DAMPENING"
+            })
+    
+    return flips
+
+
+# ============================================================================
+# TEST
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+    print("=" * 60)
+    print("NYZTrade - Live Data Test")
+    print("=" * 60)
+    
+    calc = LiveGEXDEXCalculator()
+    
+    df, futures, method, atm, error = calc.fetch_live_data("NIFTY", 10, 0)
+    
+    print("\nStatus Log:")
+    for log in calc.get_status_log():
+        print(f"  {log}")
+    
+    if error:
+        print(f"\n❌ Error: {error}")
+    else:
+        print(f"\n✅ Success!")
+        print(f"   Futures: ₹{futures:,.2f}")
+        print(f"   Method: {method}")
+        print(f"   Strikes: {len(df)}")
+        print(f"   ATM: {atm['atm_strike']}")
+        print(f"   Straddle: ₹{atm['atm_straddle_premium']:.2f}")
+        
+        flow = calculate_flow_metrics(df, futures)
+        print(f"   GEX Bias: {flow['gex_bias']}")
+        print(f"   DEX Bias: {flow['dex_bias']}")
