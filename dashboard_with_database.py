@@ -1,753 +1,1196 @@
 """
 ================================================================================
-NYZTrade - Live Data Fetcher Module
+NYZTrade - ULTRA UI GEX + DEX Dashboard
 ================================================================================
-Robust NSE data fetching with multiple fallback methods:
-1. Direct NSE API with proper session handling
-2. Groww.in futures price
-3. Multiple retry mechanisms
-4. Detailed status reporting
+Premium Design Features:
+- Glass morphism effects
+- Neon gradients
+- Smooth animations
+- Dark theme with accents
+- Real-time data indicators
+- Professional trading terminal aesthetic
 
 Author: NYZTrade
 ================================================================================
 """
 
-import requests
+import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-import json
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-from scipy.stats import norm
-import warnings
 import time
-import random
+import pytz
 
-warnings.filterwarnings('ignore')
-
-
-# ============================================================================
-# USER AGENT ROTATION
-# ============================================================================
-
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-]
-
-def get_random_ua():
-    return random.choice(USER_AGENTS)
-
+# Import live data module
+try:
+    from live_data import LiveGEXDEXCalculator, calculate_flow_metrics, detect_gamma_flips
+    LIVE_MODULE_OK = True
+except Exception as e:
+    LIVE_MODULE_OK = False
+    IMPORT_ERR = str(e)
 
 # ============================================================================
-# BLACK-SCHOLES CALCULATOR
+# PAGE CONFIG
 # ============================================================================
 
-class BlackScholesCalculator:
-    """Calculate option Greeks using Black-Scholes model"""
-    
-    @staticmethod
-    def calculate_d1(S, K, T, r, sigma):
-        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return 0
-        try:
-            d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-            return d1
-        except:
-            return 0
-
-    @staticmethod
-    def calculate_gamma(S, K, T, r, sigma):
-        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return 0
-        try:
-            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
-            n_prime_d1 = norm.pdf(d1)
-            gamma = n_prime_d1 / (S * sigma * np.sqrt(T))
-            return gamma
-        except:
-            return 0
-
-    @staticmethod
-    def calculate_call_delta(S, K, T, r, sigma):
-        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return 0
-        try:
-            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
-            return norm.cdf(d1)
-        except:
-            return 0
-
-    @staticmethod
-    def calculate_put_delta(S, K, T, r, sigma):
-        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return 0
-        try:
-            d1 = BlackScholesCalculator.calculate_d1(S, K, T, r, sigma)
-            return norm.cdf(d1) - 1
-        except:
-            return 0
-
+st.set_page_config(
+    page_title="NYZTrade Pro",
+    page_icon="🚀",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # ============================================================================
-# NSE DATA FETCHER - ROBUST VERSION
+# ULTRA CSS - GLASS MORPHISM + NEON THEME
 # ============================================================================
 
-class RobustNSEFetcher:
-    """
-    Robust NSE Option Chain Fetcher with:
-    - Proper session/cookie handling
-    - User agent rotation
-    - Multiple retry attempts
-    - Detailed status reporting
-    """
+st.markdown("""
+<style>
+    /* Import premium fonts */
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;900&family=Rajdhani:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap');
     
-    def __init__(self):
-        self.base_url = "https://www.nseindia.com"
-        self.option_chain_url = "https://www.nseindia.com/api/option-chain-indices"
-        self.session = None
-        self.cookies_valid = False
-        self.last_init_time = None
-        self.status_log = []
-        
-    def log_status(self, message, level="INFO"):
-        """Log status for debugging"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.status_log.append(f"[{timestamp}] [{level}] {message}")
-        if len(self.status_log) > 50:
-            self.status_log = self.status_log[-50:]
-    
-    def get_status_log(self):
-        """Get recent status messages"""
-        return self.status_log[-10:]
-    
-    def create_session(self):
-        """Create new session with fresh cookies"""
-        self.session = requests.Session()
-        
-        headers = {
-            'User-Agent': get_random_ua(),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Cache-Control': 'max-age=0',
-            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"Windows"',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-        }
-        
-        self.session.headers.update(headers)
-        return self.session
-    
-    def initialize_session(self, max_retries=3):
-        """Initialize session with NSE website to get cookies"""
-        
-        for attempt in range(max_retries):
-            try:
-                self.log_status(f"Initializing NSE session (attempt {attempt + 1}/{max_retries})")
-                
-                # Create fresh session
-                self.create_session()
-                
-                # First, visit the main page
-                response = self.session.get(
-                    self.base_url,
-                    timeout=15,
-                    allow_redirects=True
-                )
-                
-                if response.status_code == 200:
-                    self.log_status(f"Main page OK, cookies: {len(self.session.cookies)}")
-                    
-                    # Small delay to mimic human behavior
-                    time.sleep(0.5 + random.random())
-                    
-                    # Visit option chain page to get additional cookies
-                    oc_page = self.session.get(
-                        f"{self.base_url}/option-chain",
-                        timeout=15
-                    )
-                    
-                    if oc_page.status_code == 200:
-                        self.log_status("Option chain page OK")
-                        
-                        # Update headers for API calls
-                        self.session.headers.update({
-                            'Accept': 'application/json, text/plain, */*',
-                            'Referer': 'https://www.nseindia.com/option-chain',
-                            'X-Requested-With': 'XMLHttpRequest',
-                        })
-                        
-                        self.cookies_valid = True
-                        self.last_init_time = datetime.now()
-                        self.log_status("Session initialized successfully", "SUCCESS")
-                        return True, "Session initialized"
-                
-                self.log_status(f"Attempt {attempt + 1} failed: Status {response.status_code}", "WARNING")
-                time.sleep(1 + random.random())
-                
-            except requests.exceptions.Timeout:
-                self.log_status(f"Attempt {attempt + 1}: Timeout", "WARNING")
-            except requests.exceptions.ConnectionError as e:
-                self.log_status(f"Attempt {attempt + 1}: Connection error", "WARNING")
-            except Exception as e:
-                self.log_status(f"Attempt {attempt + 1}: {str(e)[:50]}", "ERROR")
-        
-        self.cookies_valid = False
-        return False, "Failed to initialize session after all retries"
-    
-    def fetch_option_chain(self, symbol="NIFTY", max_retries=3):
-        """Fetch option chain data with retries"""
-        
-        # Check if session needs refresh (every 3 minutes)
-        if self.last_init_time:
-            elapsed = (datetime.now() - self.last_init_time).total_seconds()
-            if elapsed > 180:
-                self.cookies_valid = False
-        
-        # Initialize if needed
-        if not self.cookies_valid or self.session is None:
-            success, msg = self.initialize_session()
-            if not success:
-                return None, msg
-        
-        url = f"{self.option_chain_url}?symbol={symbol}"
-        
-        for attempt in range(max_retries):
-            try:
-                self.log_status(f"Fetching {symbol} option chain (attempt {attempt + 1})")
-                
-                response = self.session.get(url, timeout=15)
-                
-                if response.status_code == 200:
-                    try:
-                        data = response.json()
-                        
-                        if 'records' in data and 'data' in data['records']:
-                            records = data['records']
-                            strikes_count = len(records.get('data', []))
-                            spot = records.get('underlyingValue', 0)
-                            
-                            self.log_status(f"SUCCESS: {symbol} - {strikes_count} strikes, Spot: {spot}", "SUCCESS")
-                            return data, None
-                        else:
-                            self.log_status("Invalid response format", "WARNING")
-                            
-                    except json.JSONDecodeError:
-                        self.log_status("JSON decode error", "WARNING")
-                
-                elif response.status_code == 401:
-                    self.log_status("401 Unauthorized - Refreshing session", "WARNING")
-                    self.cookies_valid = False
-                    success, msg = self.initialize_session()
-                    if not success:
-                        return None, msg
-                
-                elif response.status_code == 403:
-                    self.log_status("403 Forbidden - IP might be blocked", "ERROR")
-                    return None, "NSE blocked request (403). Try running locally."
-                
-                else:
-                    self.log_status(f"HTTP {response.status_code}", "WARNING")
-                
-                time.sleep(1 + random.random())
-                
-            except requests.exceptions.Timeout:
-                self.log_status(f"Timeout on attempt {attempt + 1}", "WARNING")
-            except Exception as e:
-                self.log_status(f"Error: {str(e)[:50]}", "ERROR")
-        
-        return None, f"Failed to fetch {symbol} after {max_retries} attempts"
-
-
-# ============================================================================
-# GROWW FUTURES FETCHER
-# ============================================================================
-
-class GrowwFuturesFetcher:
-    """Fetch futures price from Groww.in"""
-    
-    def __init__(self):
-        self.headers = {
-            'User-Agent': get_random_ua(),
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://groww.in',
-            'Referer': 'https://groww.in/derivatives',
-        }
-    
-    def get_futures_price(self, symbol, spot_price=None):
-        """
-        Fetch futures price from Groww.in
-        Returns: (price, method) or (None, error)
-        """
-        
-        # Method 1: Groww derivatives API
-        price = self._try_groww_api(symbol)
-        if price:
-            return price, "Groww API"
-        
-        # Method 2: Groww search API
-        price = self._try_groww_search(symbol)
-        if price:
-            return price, "Groww Search"
-        
-        # Method 3: Calculate from spot (if provided)
-        if spot_price:
-            # Add typical futures premium (~0.05-0.1%)
-            futures = spot_price * 1.0005
-            return round(futures, 2), "Spot+Premium"
-        
-        return None, "Groww fetch failed"
-    
-    def _try_groww_api(self, symbol):
-        """Try Groww derivatives API"""
-        try:
-            symbol_map = {
-                'NIFTY': 'NIFTY',
-                'BANKNIFTY': 'BANKNIFTY',
-                'FINNIFTY': 'FINNIFTY',
-                'MIDCPNIFTY': 'MIDCPNIFTY'
-            }
-            
-            groww_symbol = symbol_map.get(symbol, symbol)
-            
-            # Try futures contracts endpoint
-            url = f"https://groww.in/v1/api/stocks_fo_data/v1/derivatives/futures/contracts/{groww_symbol}"
-            
-            response = requests.get(url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if isinstance(data, list) and len(data) > 0:
-                    for contract in data:
-                        if 'ltp' in contract:
-                            return float(contract['ltp'])
-                        if 'lastPrice' in contract:
-                            return float(contract['lastPrice'])
-                
-                if isinstance(data, dict):
-                    if 'ltp' in data:
-                        return float(data['ltp'])
-            
-            return None
-        except:
-            return None
-    
-    def _try_groww_search(self, symbol):
-        """Try Groww search endpoint"""
-        try:
-            url = f"https://groww.in/v1/api/search/v1/entity?page=0&query={symbol}%20FUT&size=10"
-            
-            response = requests.get(url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                content = data.get('content', [])
-                for item in content:
-                    if 'FUT' in item.get('title', '').upper():
-                        ltp = item.get('ltp') or item.get('lastPrice')
-                        if ltp:
-                            return float(ltp)
-            
-            return None
-        except:
-            return None
-
-
-# ============================================================================
-# MAIN CALCULATOR
-# ============================================================================
-
-class LiveGEXDEXCalculator:
-    """
-    Live GEX + DEX Calculator with:
-    - Robust NSE fetching
-    - Groww futures price
-    - Proper error handling
-    - Status reporting
-    """
-    
-    def __init__(self):
-        self.nse_fetcher = RobustNSEFetcher()
-        self.groww_fetcher = GrowwFuturesFetcher()
-        self.bs_calc = BlackScholesCalculator()
-        self.risk_free_rate = 0.07
-        self.last_error = None
-        self.data_source = "Unknown"
-    
-    def get_contract_specs(self, symbol):
-        """Get contract specifications"""
-        specs = {
-            'NIFTY': {'lot_size': 25, 'strike_interval': 50},
-            'BANKNIFTY': {'lot_size': 15, 'strike_interval': 100},
-            'FINNIFTY': {'lot_size': 40, 'strike_interval': 50},
-            'MIDCPNIFTY': {'lot_size': 75, 'strike_interval': 25}
-        }
-        return specs.get(symbol, specs['NIFTY'])
-    
-    def calculate_time_to_expiry(self, expiry_str):
-        """Calculate time to expiry in years"""
-        try:
-            expiry = datetime.strptime(expiry_str, "%d-%b-%Y")
-            now = datetime.now()
-            
-            # Add time to end of day
-            expiry = expiry.replace(hour=15, minute=30)
-            
-            diff = expiry - now
-            days = diff.total_seconds() / (24 * 3600)
-            T = max(days / 365, 0.5/365)  # Minimum half day
-            return T, max(int(days), 1)
-        except:
-            return 7/365, 7
-    
-    def get_status_log(self):
-        """Get status log from NSE fetcher"""
-        return self.nse_fetcher.get_status_log()
-    
-    def fetch_live_data(self, symbol="NIFTY", strikes_range=12, expiry_index=0):
-        """
-        Fetch live GEX/DEX data
-        
-        Returns:
-            tuple: (df, futures_ltp, fetch_method, atm_info, error_message)
-        """
-        
-        self.last_error = None
-        
-        # Step 1: Fetch NSE option chain
-        data, error = self.nse_fetcher.fetch_option_chain(symbol)
-        
-        if error or not data:
-            self.last_error = error or "No data received"
-            self.data_source = "Failed"
-            return None, None, None, None, self.last_error
-        
-        try:
-            records = data['records']
-            spot_price = records.get('underlyingValue', 0)
-            timestamp = records.get('timestamp', datetime.now().strftime('%d-%b-%Y %H:%M:%S'))
-            expiry_dates = records.get('expiryDates', [])
-            
-            if not expiry_dates or spot_price == 0:
-                self.last_error = "Invalid data: No expiries or spot price"
-                return None, None, None, None, self.last_error
-            
-            # Select expiry
-            selected_expiry = expiry_dates[min(expiry_index, len(expiry_dates) - 1)]
-            T, days_to_expiry = self.calculate_time_to_expiry(selected_expiry)
-            
-            # Step 2: Get futures price
-            futures_ltp, fetch_method = self.groww_fetcher.get_futures_price(symbol, spot_price)
-            
-            if not futures_ltp:
-                # Fallback: Use spot + premium
-                futures_ltp = spot_price * 1.0003
-                fetch_method = "Spot+Premium"
-            
-            self.data_source = f"NSE Live + {fetch_method}"
-            
-            # Get specs
-            specs = self.get_contract_specs(symbol)
-            lot_size = specs['lot_size']
-            strike_interval = specs['strike_interval']
-            
-            # Process strikes
-            all_strikes = []
-            processed = set()
-            atm_strike = None
-            min_diff = float('inf')
-            atm_call_premium = 0
-            atm_put_premium = 0
-            
-            for item in records.get('data', []):
-                if item.get('expiryDate') != selected_expiry:
-                    continue
-                
-                strike = item.get('strikePrice', 0)
-                if strike == 0 or strike in processed:
-                    continue
-                
-                processed.add(strike)
-                
-                # Filter by range
-                distance = abs(strike - futures_ltp) / strike_interval
-                if distance > strikes_range:
-                    continue
-                
-                ce = item.get('CE', {})
-                pe = item.get('PE', {})
-                
-                # Extract data
-                call_oi = ce.get('openInterest', 0) or 0
-                put_oi = pe.get('openInterest', 0) or 0
-                call_oi_change = ce.get('changeinOpenInterest', 0) or 0
-                put_oi_change = pe.get('changeinOpenInterest', 0) or 0
-                call_volume = ce.get('totalTradedVolume', 0) or 0
-                put_volume = pe.get('totalTradedVolume', 0) or 0
-                call_iv = ce.get('impliedVolatility', 0) or 15
-                put_iv = pe.get('impliedVolatility', 0) or 15
-                call_ltp = ce.get('lastPrice', 0) or 0
-                put_ltp = pe.get('lastPrice', 0) or 0
-                
-                # Track ATM
-                diff = abs(strike - futures_ltp)
-                if diff < min_diff:
-                    min_diff = diff
-                    atm_strike = strike
-                    atm_call_premium = call_ltp
-                    atm_put_premium = put_ltp
-                
-                # Calculate Greeks
-                call_iv_dec = max(call_iv / 100, 0.05)
-                put_iv_dec = max(put_iv / 100, 0.05)
-                
-                call_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
-                put_gamma = self.bs_calc.calculate_gamma(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
-                call_delta = self.bs_calc.calculate_call_delta(futures_ltp, strike, T, self.risk_free_rate, call_iv_dec)
-                put_delta = self.bs_calc.calculate_put_delta(futures_ltp, strike, T, self.risk_free_rate, put_iv_dec)
-                
-                # GEX calculation (in Billions)
-                gex_mult = futures_ltp * futures_ltp * lot_size / 1_000_000_000
-                call_gex = call_oi * call_gamma * gex_mult
-                put_gex = -put_oi * put_gamma * gex_mult
-                
-                # DEX calculation (in Billions)
-                dex_mult = futures_ltp * lot_size / 1_000_000_000
-                call_dex = call_oi * call_delta * dex_mult
-                put_dex = put_oi * put_delta * dex_mult
-                
-                all_strikes.append({
-                    'Strike': strike,
-                    'Call_OI': call_oi,
-                    'Put_OI': put_oi,
-                    'Call_OI_Change': call_oi_change,
-                    'Put_OI_Change': put_oi_change,
-                    'Call_Volume': call_volume,
-                    'Put_Volume': put_volume,
-                    'Call_IV': call_iv,
-                    'Put_IV': put_iv,
-                    'Call_LTP': call_ltp,
-                    'Put_LTP': put_ltp,
-                    'Call_Gamma': call_gamma,
-                    'Put_Gamma': put_gamma,
-                    'Call_Delta': call_delta,
-                    'Put_Delta': put_delta,
-                    'Call_GEX': call_gex,
-                    'Put_GEX': put_gex,
-                    'Net_GEX': call_gex + put_gex,
-                    'Call_DEX': call_dex,
-                    'Put_DEX': put_dex,
-                    'Net_DEX': call_dex + put_dex,
-                })
-            
-            if not all_strikes:
-                self.last_error = "No strikes found for selected expiry"
-                return None, None, None, None, self.last_error
-            
-            # Create DataFrame
-            df = pd.DataFrame(all_strikes).sort_values('Strike').reset_index(drop=True)
-            
-            # Add _B suffix columns for compatibility
-            for col in ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_DEX', 'Put_DEX', 'Net_DEX']:
-                df[f'{col}_B'] = df[col]
-            
-            df['Total_Volume'] = df['Call_Volume'] + df['Put_Volume']
-            df['Total_OI'] = df['Call_OI'] + df['Put_OI']
-            
-            # Hedging Pressure
-            max_gex = df['Net_GEX_B'].abs().max()
-            df['Hedging_Pressure'] = (df['Net_GEX_B'] / max_gex * 100) if max_gex > 0 else 0
-            
-            # ATM info
-            atm_info = {
-                'atm_strike': atm_strike or df.iloc[len(df)//2]['Strike'],
-                'atm_call_premium': atm_call_premium,
-                'atm_put_premium': atm_put_premium,
-                'atm_straddle_premium': atm_call_premium + atm_put_premium,
-                'spot_price': spot_price,
-                'expiry_date': selected_expiry,
-                'days_to_expiry': days_to_expiry,
-                'timestamp': timestamp,
-                'expiry_index': expiry_index,
-                'all_expiries': expiry_dates[:5]  # First 5 expiries
-            }
-            
-            return df, futures_ltp, self.data_source, atm_info, None
-            
-        except Exception as e:
-            self.last_error = f"Processing error: {str(e)}"
-            return None, None, None, None, self.last_error
-
-
-# ============================================================================
-# FLOW METRICS - VOLATILITY TERMINOLOGY
-# ============================================================================
-
-def calculate_flow_metrics(df, futures_ltp):
-    """
-    Calculate GEX/DEX flow metrics with volatility terminology
-    
-    Positive GEX = Volatility Dampening
-    Negative GEX = Volatility Amplifying
-    """
-    
-    df_unique = df.drop_duplicates(subset=['Strike']).sort_values('Strike').reset_index(drop=True)
-    
-    # Near-term GEX (5 positive + 5 negative closest to spot)
-    pos_gex = df_unique[df_unique['Net_GEX_B'] > 0].copy()
-    if len(pos_gex) > 0:
-        pos_gex['Dist'] = abs(pos_gex['Strike'] - futures_ltp)
-        pos_gex = pos_gex.nsmallest(5, 'Dist')
-    
-    neg_gex = df_unique[df_unique['Net_GEX_B'] < 0].copy()
-    if len(neg_gex) > 0:
-        neg_gex['Dist'] = abs(neg_gex['Strike'] - futures_ltp)
-        neg_gex = neg_gex.nsmallest(5, 'Dist')
-    
-    gex_near_pos = float(pos_gex['Net_GEX_B'].sum()) if len(pos_gex) > 0 else 0
-    gex_near_neg = float(neg_gex['Net_GEX_B'].sum()) if len(neg_gex) > 0 else 0
-    gex_near_total = gex_near_pos + gex_near_neg
-    
-    # Total GEX
-    gex_total = float(df_unique['Net_GEX_B'].sum())
-    
-    # DEX flow (strikes above/below spot)
-    above = df_unique[df_unique['Strike'] > futures_ltp].head(5)
-    below = df_unique[df_unique['Strike'] < futures_ltp].tail(5)
-    
-    dex_near_pos = float(above['Net_DEX_B'].sum()) if len(above) > 0 else 0
-    dex_near_neg = float(below['Net_DEX_B'].sum()) if len(below) > 0 else 0
-    dex_near_total = dex_near_pos + dex_near_neg
-    
-    # Total DEX
-    dex_total = float(df_unique['Net_DEX_B'].sum())
-    
-    # Key levels
-    max_call_oi_strike = float(df_unique.loc[df_unique['Call_OI'].idxmax(), 'Strike'])
-    max_put_oi_strike = float(df_unique.loc[df_unique['Put_OI'].idxmax(), 'Strike'])
-    
-    # PCR
-    total_call_oi = df_unique['Call_OI'].sum()
-    total_put_oi = df_unique['Put_OI'].sum()
-    pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1
-    
-    # Bias determination with VOLATILITY terminology
-    def get_gex_bias(val):
-        if val > 100:
-            return "🟢 STRONG DAMPENING", "#00d4aa"
-        elif val > 0:
-            return "🟢 DAMPENING", "#55efc4"
-        elif val > -100:
-            return "🔴 AMPLIFYING", "#ff6b6b"
-        else:
-            return "🔴 STRONG AMPLIFYING", "#e74c3c"
-    
-    def get_dex_bias(val):
-        if val > 50:
-            return "🟢 STRONG BULLISH", "#00d4aa"
-        elif val > 0:
-            return "🟢 BULLISH", "#55efc4"
-        elif val > -50:
-            return "🔴 BEARISH", "#ff6b6b"
-        else:
-            return "🔴 STRONG BEARISH", "#e74c3c"
-    
-    gex_bias, gex_color = get_gex_bias(gex_near_total)
-    dex_bias, dex_color = get_dex_bias(dex_near_total)
-    
-    # Combined signal
-    combined = (gex_near_total + dex_near_total) / 2
-    if gex_near_total > 50 and dex_near_total > 20:
-        combined_bias = "🟢 DAMPENING + BULLISH"
-    elif gex_near_total > 50 and dex_near_total < -20:
-        combined_bias = "🟡 DAMPENING + BEARISH"
-    elif gex_near_total < -50 and dex_near_total > 20:
-        combined_bias = "⚡ AMPLIFYING + BULLISH"
-    elif gex_near_total < -50 and dex_near_total < -20:
-        combined_bias = "🔴 AMPLIFYING + BEARISH"
-    else:
-        combined_bias = "⚪ NEUTRAL"
-    
-    return {
-        'gex_near_total': gex_near_total,
-        'gex_near_positive': gex_near_pos,
-        'gex_near_negative': gex_near_neg,
-        'gex_total': gex_total,
-        'gex_bias': gex_bias,
-        'gex_color': gex_color,
-        'dex_near_total': dex_near_total,
-        'dex_total': dex_total,
-        'dex_bias': dex_bias,
-        'dex_color': dex_color,
-        'combined_signal': combined,
-        'combined_bias': combined_bias,
-        'max_call_oi_strike': max_call_oi_strike,
-        'max_put_oi_strike': max_put_oi_strike,
-        'pcr': pcr,
-        'total_call_oi': total_call_oi,
-        'total_put_oi': total_put_oi
+    /* Root variables */
+    :root {
+        --neon-cyan: #00f5ff;
+        --neon-pink: #ff00ff;
+        --neon-green: #39ff14;
+        --neon-orange: #ff6600;
+        --dark-bg: #0a0a0f;
+        --card-bg: rgba(20, 20, 35, 0.85);
+        --glass-border: rgba(255, 255, 255, 0.1);
     }
-
-
-def detect_gamma_flips(df):
-    """Detect gamma flip zones"""
-    flips = []
-    df_sorted = df.sort_values('Strike').reset_index(drop=True)
     
-    for i in range(len(df_sorted) - 1):
-        curr = df_sorted.loc[i, 'Net_GEX_B']
-        next_val = df_sorted.loc[i + 1, 'Net_GEX_B']
+    /* Main background */
+    .stApp {
+        background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 50%, #0f0f1a 100%);
+        background-attachment: fixed;
+    }
+    
+    /* Hide default elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    /* Scrollbar */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+        background: #0a0a0f;
+    }
+    ::-webkit-scrollbar-thumb {
+        background: linear-gradient(180deg, #00f5ff, #ff00ff);
+        border-radius: 4px;
+    }
+    
+    /* Main header */
+    .ultra-header {
+        font-family: 'Orbitron', monospace;
+        font-size: 3rem;
+        font-weight: 900;
+        text-align: center;
+        background: linear-gradient(90deg, #00f5ff, #ff00ff, #00f5ff);
+        background-size: 200% auto;
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        animation: gradient-shift 3s ease infinite;
+        text-shadow: 0 0 30px rgba(0, 245, 255, 0.5);
+        margin-bottom: 0.5rem;
+        letter-spacing: 4px;
+    }
+    
+    @keyframes gradient-shift {
+        0% { background-position: 0% center; }
+        50% { background-position: 100% center; }
+        100% { background-position: 0% center; }
+    }
+    
+    .sub-header {
+        font-family: 'Rajdhani', sans-serif;
+        font-size: 1.1rem;
+        color: rgba(255, 255, 255, 0.6);
+        text-align: center;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+    }
+    
+    /* Glass card */
+    .glass-card {
+        background: rgba(20, 20, 35, 0.7);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 16px;
+        padding: 1.5rem;
+        margin: 0.5rem 0;
+        box-shadow: 
+            0 8px 32px rgba(0, 0, 0, 0.4),
+            inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        transition: all 0.3s ease;
+    }
+    
+    .glass-card:hover {
+        border-color: rgba(0, 245, 255, 0.3);
+        box-shadow: 
+            0 8px 32px rgba(0, 0, 0, 0.4),
+            0 0 20px rgba(0, 245, 255, 0.2),
+            inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    }
+    
+    /* Metric card */
+    .metric-card {
+        background: linear-gradient(145deg, rgba(30, 30, 50, 0.9), rgba(15, 15, 25, 0.9));
+        border: 1px solid rgba(0, 245, 255, 0.2);
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        text-align: center;
+        position: relative;
+        overflow: hidden;
+    }
+    
+    .metric-card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, #00f5ff, #ff00ff);
+    }
+    
+    .metric-label {
+        font-family: 'Rajdhani', sans-serif;
+        font-size: 0.85rem;
+        color: rgba(255, 255, 255, 0.5);
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        margin-bottom: 0.3rem;
+    }
+    
+    .metric-value {
+        font-family: 'Orbitron', monospace;
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #fff;
+    }
+    
+    .metric-delta {
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.9rem;
+        margin-top: 0.3rem;
+    }
+    
+    .delta-up { color: #39ff14; }
+    .delta-down { color: #ff4757; }
+    
+    /* Live indicator */
+    .live-pulse {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: rgba(57, 255, 20, 0.15);
+        border: 1px solid rgba(57, 255, 20, 0.4);
+        padding: 6px 16px;
+        border-radius: 20px;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.9rem;
+        color: #39ff14;
+    }
+    
+    .live-dot {
+        width: 10px;
+        height: 10px;
+        background: #39ff14;
+        border-radius: 50%;
+        animation: pulse 1.5s ease infinite;
+        box-shadow: 0 0 10px #39ff14;
+    }
+    
+    @keyframes pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.5; transform: scale(0.8); }
+    }
+    
+    /* Historical indicator */
+    .hist-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: rgba(255, 165, 0, 0.15);
+        border: 1px solid rgba(255, 165, 0, 0.4);
+        padding: 6px 16px;
+        border-radius: 20px;
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.9rem;
+        color: #ffa500;
+    }
+    
+    /* Bias boxes */
+    .dampening-box {
+        background: linear-gradient(135deg, rgba(57, 255, 20, 0.2), rgba(0, 212, 170, 0.2));
+        border: 1px solid rgba(57, 255, 20, 0.4);
+        border-radius: 12px;
+        padding: 1.2rem;
+        text-align: center;
+    }
+    
+    .dampening-box h3 {
+        font-family: 'Orbitron', monospace;
+        color: #39ff14;
+        margin: 0 0 0.5rem 0;
+        font-size: 1.1rem;
+    }
+    
+    .dampening-box p {
+        font-family: 'Rajdhani', sans-serif;
+        color: rgba(255, 255, 255, 0.8);
+        margin: 0;
+    }
+    
+    .amplifying-box {
+        background: linear-gradient(135deg, rgba(255, 71, 87, 0.2), rgba(255, 0, 102, 0.2));
+        border: 1px solid rgba(255, 71, 87, 0.4);
+        border-radius: 12px;
+        padding: 1.2rem;
+        text-align: center;
+    }
+    
+    .amplifying-box h3 {
+        font-family: 'Orbitron', monospace;
+        color: #ff4757;
+        margin: 0 0 0.5rem 0;
+        font-size: 1.1rem;
+    }
+    
+    .amplifying-box p {
+        font-family: 'Rajdhani', sans-serif;
+        color: rgba(255, 255, 255, 0.8);
+        margin: 0;
+    }
+    
+    .bullish-box {
+        background: linear-gradient(135deg, rgba(0, 245, 255, 0.15), rgba(0, 212, 170, 0.15));
+        border: 1px solid rgba(0, 245, 255, 0.3);
+        border-radius: 12px;
+        padding: 1.2rem;
+        text-align: center;
+    }
+    
+    .bearish-box {
+        background: linear-gradient(135deg, rgba(255, 102, 0, 0.15), rgba(255, 71, 87, 0.15));
+        border: 1px solid rgba(255, 102, 0, 0.3);
+        border-radius: 12px;
+        padding: 1.2rem;
+        text-align: center;
+    }
+    
+    /* Sidebar styling */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, rgba(10, 10, 15, 0.98), rgba(20, 20, 35, 0.98));
+        border-right: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+        font-family: 'Rajdhani', sans-serif;
+    }
+    
+    /* Buttons */
+    .stButton > button {
+        font-family: 'Rajdhani', sans-serif;
+        font-weight: 600;
+        letter-spacing: 1px;
+        background: linear-gradient(135deg, rgba(0, 245, 255, 0.2), rgba(255, 0, 255, 0.2));
+        border: 1px solid rgba(0, 245, 255, 0.4);
+        color: #00f5ff;
+        transition: all 0.3s ease;
+    }
+    
+    .stButton > button:hover {
+        background: linear-gradient(135deg, rgba(0, 245, 255, 0.4), rgba(255, 0, 255, 0.4));
+        border-color: #00f5ff;
+        box-shadow: 0 0 20px rgba(0, 245, 255, 0.4);
+        transform: translateY(-2px);
+    }
+    
+    /* Select boxes */
+    [data-testid="stSelectbox"] {
+        font-family: 'Rajdhani', sans-serif;
+    }
+    
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background: rgba(20, 20, 35, 0.5);
+        padding: 8px;
+        border-radius: 12px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        font-family: 'Rajdhani', sans-serif;
+        font-weight: 600;
+        letter-spacing: 1px;
+        background: transparent;
+        border-radius: 8px;
+        color: rgba(255, 255, 255, 0.6);
+        border: 1px solid transparent;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, rgba(0, 245, 255, 0.2), rgba(255, 0, 255, 0.2));
+        border: 1px solid rgba(0, 245, 255, 0.4);
+        color: #00f5ff;
+    }
+    
+    /* Expander */
+    .streamlit-expanderHeader {
+        font-family: 'Rajdhani', sans-serif;
+        font-weight: 600;
+        background: rgba(30, 30, 50, 0.5);
+        border-radius: 8px;
+    }
+    
+    /* Time machine section */
+    .time-machine-header {
+        font-family: 'Orbitron', monospace;
+        font-size: 1.5rem;
+        color: #ff00ff;
+        margin: 1rem 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    
+    /* Quick jump buttons */
+    .quick-jump-btn {
+        font-family: 'Share Tech Mono', monospace;
+        background: rgba(255, 0, 255, 0.1);
+        border: 1px solid rgba(255, 0, 255, 0.3);
+        color: #ff00ff;
+        padding: 8px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+    
+    .quick-jump-btn:hover {
+        background: rgba(255, 0, 255, 0.3);
+        box-shadow: 0 0 15px rgba(255, 0, 255, 0.3);
+    }
+    
+    /* Status log */
+    .status-log {
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.8rem;
+        background: rgba(0, 0, 0, 0.3);
+        border-radius: 8px;
+        padding: 1rem;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+    
+    .status-log .success { color: #39ff14; }
+    .status-log .warning { color: #ffa500; }
+    .status-log .error { color: #ff4757; }
+    .status-log .info { color: #00f5ff; }
+    
+    /* Gamma flip warning */
+    .gamma-flip-alert {
+        background: linear-gradient(135deg, rgba(255, 215, 0, 0.15), rgba(255, 165, 0, 0.15));
+        border: 1px solid rgba(255, 215, 0, 0.4);
+        border-left: 4px solid #ffd700;
+        border-radius: 8px;
+        padding: 1rem;
+        font-family: 'Rajdhani', sans-serif;
+    }
+    
+    /* Footer */
+    .ultra-footer {
+        font-family: 'Share Tech Mono', monospace;
+        font-size: 0.85rem;
+        color: rgba(255, 255, 255, 0.4);
+        text-align: center;
+        padding: 1rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+        margin-top: 2rem;
+    }
+    
+    /* Animations */
+    @keyframes glow {
+        0%, 100% { box-shadow: 0 0 5px currentColor; }
+        50% { box-shadow: 0 0 20px currentColor, 0 0 30px currentColor; }
+    }
+    
+    @keyframes slideIn {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    .animate-in {
+        animation: slideIn 0.5s ease forwards;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
+def check_password():
+    """Returns True if user has entered correct password"""
+    
+    def password_entered():
+        username = st.session_state.get("username", "").strip().lower()
+        password = st.session_state.get("password", "")
         
-        if (curr > 0 and next_val < 0) or (curr < 0 and next_val > 0):
-            flips.append({
-                'lower': df_sorted.loc[i, 'Strike'],
-                'upper': df_sorted.loc[i + 1, 'Strike'],
-                'type': "DAMPENING → AMPLIFYING" if curr > 0 else "AMPLIFYING → DAMPENING"
-            })
+        users = {
+            "demo": "demo123",
+            "premium": "premium123", 
+            "niyas": "nyztrade123"
+        }
+        
+        if username in users and password == users[username]:
+            st.session_state["password_correct"] = True
+            st.session_state["authenticated_user"] = username
+            if "password" in st.session_state:
+                del st.session_state["password"]
+            return
+        
+        st.session_state["password_correct"] = False
     
-    return flips
+    if "password_correct" not in st.session_state:
+        st.markdown('<h1 class="ultra-header">NYZTrade</h1>', unsafe_allow_html=True)
+        st.markdown('<p class="sub-header">Advanced Options Analytics Terminal</p>', unsafe_allow_html=True)
+        st.markdown("---")
+        
+        col1, col2, col3 = st.columns([1, 1.5, 1])
+        
+        with col2:
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            st.markdown("### 🔐 Secure Login")
+            st.text_input("Username", key="username", placeholder="Enter username")
+            st.text_input("Password", type="password", key="password", placeholder="Enter password")
+            st.button("🚀 Access Terminal", on_click=password_entered, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.markdown("---")
+            st.info("""
+            **Demo Access:**  
+            `demo` / `demo123`  
+            
+            **Premium Access:**  
+            `premium` / `premium123`
+            """)
+        
+        return False
+    
+    elif not st.session_state.get("password_correct", False):
+        st.markdown('<h1 class="ultra-header">NYZTrade</h1>', unsafe_allow_html=True)
+        st.error("❌ Invalid credentials")
+        
+        col1, col2, col3 = st.columns([1, 1.5, 1])
+        with col2:
+            st.text_input("Username", key="username", placeholder="Enter username")
+            st.text_input("Password", type="password", key="password", placeholder="Enter password")
+            st.button("🚀 Access Terminal", on_click=password_entered, use_container_width=True)
+        
+        return False
+    
+    return True
 
+def get_user_tier():
+    username = st.session_state.get("authenticated_user", "guest")
+    return "premium" if username in ["premium", "niyas"] else "basic"
+
+def get_ist_time():
+    ist = pytz.timezone('Asia/Kolkata')
+    return datetime.now(ist)
 
 # ============================================================================
-# TEST
+# SESSION STATE
 # ============================================================================
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("NYZTrade - Live Data Test")
-    print("=" * 60)
+def init_session_state():
+    defaults = {
+        'snapshots_by_config': {},
+        'current_config_key': None,
+        'selected_time_index': None,
+        'is_live_mode': True,
+        'last_capture_time': None,
+        'auto_capture': True,
+        'capture_interval': 3,
+        'force_capture': False,
+        'calculator': None,
+        'status_messages': []
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+# Check auth first
+if not check_password():
+    st.stop()
+
+# Initialize
+init_session_state()
+user_tier = get_user_tier()
+
+# Initialize calculator
+if st.session_state.calculator is None and LIVE_MODULE_OK:
+    st.session_state.calculator = LiveGEXDEXCalculator()
+
+# ============================================================================
+# TIME MACHINE FUNCTIONS
+# ============================================================================
+
+def get_config_key(symbol, expiry_index):
+    return f"{symbol}_{expiry_index}"
+
+def get_current_snapshots():
+    key = st.session_state.current_config_key
+    if key and key in st.session_state.snapshots_by_config:
+        return st.session_state.snapshots_by_config[key]
+    return {'times': [], 'data': {}}
+
+def capture_snapshot(df, futures_ltp, fetch_method, atm_info, flow_metrics, symbol, expiry_index):
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist).replace(microsecond=0)
     
-    calc = LiveGEXDEXCalculator()
+    if st.session_state.last_capture_time:
+        elapsed = (now - st.session_state.last_capture_time).total_seconds() / 60
+        if elapsed < st.session_state.capture_interval and not st.session_state.force_capture:
+            return False
     
-    df, futures, method, atm, error = calc.fetch_live_data("NIFTY", 10, 0)
+    config_key = get_config_key(symbol, expiry_index)
     
-    print("\nStatus Log:")
-    for log in calc.get_status_log():
-        print(f"  {log}")
+    if config_key not in st.session_state.snapshots_by_config:
+        st.session_state.snapshots_by_config[config_key] = {'times': [], 'data': {}}
+    
+    config = st.session_state.snapshots_by_config[config_key]
+    
+    config['data'][now] = {
+        'df': df.copy(),
+        'futures_ltp': futures_ltp,
+        'fetch_method': fetch_method,
+        'atm_info': atm_info.copy() if atm_info else None,
+        'flow_metrics': flow_metrics.copy() if flow_metrics else None,
+        'symbol': symbol,
+        'expiry_index': expiry_index
+    }
+    
+    if now not in config['times']:
+        config['times'].append(now)
+        config['times'].sort()
+    
+    st.session_state.last_capture_time = now
+    st.session_state.force_capture = False
+    
+    while len(config['times']) > 500:
+        oldest = config['times'].pop(0)
+        config['data'].pop(oldest, None)
+    
+    return True
+
+# ============================================================================
+# HEADER
+# ============================================================================
+
+st.markdown('<h1 class="ultra-header">NYZTrade Pro</h1>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Real-Time Gamma & Delta Exposure Analysis</p>', unsafe_allow_html=True)
+
+# ============================================================================
+# SIDEBAR
+# ============================================================================
+
+with st.sidebar:
+    # User badge
+    if user_tier == "premium":
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #ffd700, #ff8c00); padding: 10px 15px; border-radius: 10px; text-align: center; margin-bottom: 1rem;">
+            <span style="font-family: 'Orbitron', monospace; color: #000; font-weight: bold;">👑 PREMIUM</span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="background: rgba(100, 100, 100, 0.3); padding: 10px 15px; border-radius: 10px; text-align: center; margin-bottom: 1rem;">
+            <span style="font-family: 'Rajdhani', sans-serif; color: #aaa;">🆓 Free Tier</span>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    if st.button("🚪 Logout", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+    
+    st.markdown("---")
+    st.markdown("### ⚙️ Settings")
+    
+    symbol = st.selectbox(
+        "📊 Index",
+        ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
+        index=0
+    )
+    
+    strikes_range = st.slider(
+        "📏 Strikes Range",
+        min_value=5,
+        max_value=20,
+        value=12
+    )
+    
+    expiry_index = st.selectbox(
+        "📅 Expiry",
+        [0, 1, 2],
+        format_func=lambda x: ["Current Weekly", "Next Weekly", "Monthly"][x],
+        index=0
+    )
+    
+    st.markdown("---")
+    st.markdown("### ⏰ Time Machine")
+    
+    config_key = get_config_key(symbol, expiry_index)
+    st.session_state.current_config_key = config_key
+    
+    config = st.session_state.snapshots_by_config.get(config_key, {'times': []})
+    snapshot_count = len(config.get('times', []))
+    
+    st.metric("📸 Snapshots", snapshot_count)
+    
+    if snapshot_count > 0:
+        st.caption(f"First: {config['times'][0].strftime('%I:%M %p')}")
+        st.caption(f"Last: {config['times'][-1].strftime('%I:%M %p')}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.auto_capture = st.checkbox("Auto", value=st.session_state.auto_capture)
+    with col2:
+        st.session_state.capture_interval = st.selectbox(
+            "Int",
+            [1, 2, 3, 5],
+            index=2,
+            format_func=lambda x: f"{x}m",
+            label_visibility="collapsed"
+        )
+    
+    if st.button("📸 Capture Now", use_container_width=True, type="primary"):
+        st.session_state.force_capture = True
+    
+    st.markdown("---")
+    
+    if user_tier == "premium":
+        auto_refresh = st.checkbox("🔄 Auto-Refresh", value=False)
+        if auto_refresh:
+            refresh_interval = st.slider("Interval (sec)", 30, 180, 60, step=30)
+            
+            if 'countdown_start' not in st.session_state:
+                st.session_state.countdown_start = time.time()
+            
+            elapsed = time.time() - st.session_state.countdown_start
+            remaining = max(0, refresh_interval - int(elapsed))
+            
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #667eea, #764ba2); padding: 10px; border-radius: 8px; text-align: center;">
+                <span style="font-family: 'Orbitron', monospace; color: white; font-size: 1.2rem;">⏱️ {remaining}s</span>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        auto_refresh = False
+        refresh_interval = 60
+        st.info("🔒 Auto-refresh: Premium")
+    
+    if st.button("🔄 Refresh Now", use_container_width=True):
+        st.cache_data.clear()
+        if 'countdown_start' in st.session_state:
+            st.session_state.countdown_start = time.time()
+        st.rerun()
+
+# ============================================================================
+# MAIN CONTENT - TIME MACHINE UI
+# ============================================================================
+
+st.markdown("---")
+
+# Time Machine Section
+expiry_labels = {0: "Current Weekly", 1: "Next Weekly", 2: "Monthly"}
+
+col1, col2, col3 = st.columns([3, 1, 1])
+
+with col1:
+    st.markdown(f'<div class="time-machine-header">⏰ Time Machine - {symbol} ({expiry_labels[expiry_index]})</div>', unsafe_allow_html=True)
+
+with col2:
+    if st.session_state.is_live_mode:
+        st.markdown('<div class="live-pulse"><div class="live-dot"></div>LIVE</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="hist-badge">📜 HISTORICAL</div>', unsafe_allow_html=True)
+
+with col3:
+    if not st.session_state.is_live_mode:
+        if st.button("🔴 Go Live", key="go_live"):
+            st.session_state.is_live_mode = True
+            st.session_state.selected_time_index = None
+            st.rerun()
+
+# Snapshot slider
+config = get_current_snapshots()
+snapshot_times = config.get('times', [])
+historical_data = None
+
+if snapshot_times:
+    st.caption(f"📊 **{len(snapshot_times)} snapshots** | {snapshot_times[0].strftime('%I:%M %p')} → {snapshot_times[-1].strftime('%I:%M %p')}")
+    
+    if len(snapshot_times) > 1:
+        time_labels = [t.strftime('%I:%M %p') for t in snapshot_times]
+        
+        current_idx = st.session_state.selected_time_index
+        if current_idx is None or current_idx >= len(snapshot_times):
+            current_idx = len(snapshot_times) - 1
+        
+        selected_idx = st.select_slider(
+            "🕐 Select Time Point",
+            options=list(range(len(snapshot_times))),
+            value=current_idx,
+            format_func=lambda x: time_labels[x]
+        )
+        
+        if selected_idx != len(snapshot_times) - 1:
+            st.session_state.is_live_mode = False
+            st.session_state.selected_time_index = selected_idx
+        
+        # Quick jump buttons
+        st.markdown("**⚡ Quick Jump:**")
+        qcols = st.columns(7)
+        presets = [("5m", 5), ("15m", 15), ("30m", 30), ("1h", 60), ("2h", 120), ("3h", 180), ("Start", 9999)]
+        
+        for idx, (label, minutes) in enumerate(presets):
+            with qcols[idx]:
+                if st.button(label, key=f"qj_{label}", use_container_width=True):
+                    if minutes == 9999:
+                        target_idx = 0
+                    else:
+                        ist = pytz.timezone('Asia/Kolkata')
+                        target_time = datetime.now(ist) - timedelta(minutes=minutes)
+                        target_idx = min(
+                            range(len(snapshot_times)),
+                            key=lambda i: abs((snapshot_times[i] - target_time).total_seconds())
+                        )
+                    st.session_state.selected_time_index = target_idx
+                    st.session_state.is_live_mode = False
+                    st.rerun()
+        
+        # Get historical data if in historical mode
+        if not st.session_state.is_live_mode and st.session_state.selected_time_index is not None:
+            if st.session_state.selected_time_index < len(snapshot_times):
+                selected_time = snapshot_times[st.session_state.selected_time_index]
+                historical_data = config['data'].get(selected_time)
+else:
+    st.info("📝 No snapshots yet. Data will be captured automatically.")
+
+# ============================================================================
+# DATA FETCHING
+# ============================================================================
+
+st.markdown("---")
+
+if historical_data and not st.session_state.is_live_mode:
+    # Using historical data
+    df = historical_data['df']
+    futures_ltp = historical_data['futures_ltp']
+    fetch_method = historical_data['fetch_method']
+    atm_info = historical_data['atm_info']
+    flow_metrics = historical_data['flow_metrics']
+    
+    is_historical = True
+    hist_time = snapshot_times[st.session_state.selected_time_index]
+    
+    st.markdown(f"""
+    <div class="hist-badge" style="width: 100%; text-align: center; padding: 15px;">
+        📜 HISTORICAL MODE - Viewing data from {hist_time.strftime('%I:%M:%S %p IST')}
+    </div>
+    """, unsafe_allow_html=True)
+    
+else:
+    # Fetch live data
+    is_historical = False
+    hist_time = None
+    
+    if not LIVE_MODULE_OK:
+        st.error(f"❌ Live data module error: {IMPORT_ERR}")
+        st.info("Make sure `live_data.py` is in the same folder as this file.")
+        st.stop()
+    
+    with st.spinner(f"🔄 Fetching live {symbol} data..."):
+        calc = st.session_state.calculator
+        df, futures_ltp, fetch_method, atm_info, error = calc.fetch_live_data(
+            symbol=symbol,
+            strikes_range=strikes_range,
+            expiry_index=expiry_index
+        )
+    
+    # Show status log in expander
+    with st.expander("📋 Connection Status Log"):
+        status_log = calc.get_status_log()
+        for log in status_log:
+            if "SUCCESS" in log:
+                st.markdown(f'<span class="status-log success">{log}</span>', unsafe_allow_html=True)
+            elif "WARNING" in log:
+                st.markdown(f'<span class="status-log warning">{log}</span>', unsafe_allow_html=True)
+            elif "ERROR" in log:
+                st.markdown(f'<span class="status-log error">{log}</span>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<span class="status-log info">{log}</span>', unsafe_allow_html=True)
     
     if error:
-        print(f"\n❌ Error: {error}")
-    else:
-        print(f"\n✅ Success!")
-        print(f"   Futures: ₹{futures:,.2f}")
-        print(f"   Method: {method}")
-        print(f"   Strikes: {len(df)}")
-        print(f"   ATM: {atm['atm_strike']}")
-        print(f"   Straddle: ₹{atm['atm_straddle_premium']:.2f}")
+        st.error(f"❌ {error}")
+        st.warning("""
+        **Troubleshooting:**
+        1. **Cloud Server Issue**: NSE blocks cloud server IPs. Try running locally.
+        2. **Run locally**: `pip install streamlit pandas numpy plotly scipy requests pytz`
+        3. **Then**: `streamlit run app.py`
+        4. **VPN**: Try using an Indian VPN if running from outside India.
+        """)
+        st.stop()
+    
+    if df is None:
+        st.error("❌ Failed to fetch data")
+        st.stop()
+    
+    # Calculate flow metrics
+    try:
+        flow_metrics = calculate_flow_metrics(df, futures_ltp)
+    except Exception as e:
+        flow_metrics = None
+    
+    # Auto capture
+    if st.session_state.auto_capture or st.session_state.force_capture:
+        if capture_snapshot(df, futures_ltp, fetch_method, atm_info, flow_metrics, symbol, expiry_index):
+            st.toast("📸 Snapshot captured!", icon="✅")
+    
+    st.markdown(f"""
+    <div class="live-pulse" style="width: 100%; justify-content: center; padding: 15px;">
+        <div class="live-dot"></div>
+        LIVE DATA - {symbol} ({expiry_labels[expiry_index]}) via {fetch_method}
+    </div>
+    """, unsafe_allow_html=True)
+
+# ============================================================================
+# KEY METRICS
+# ============================================================================
+
+st.markdown("### 📊 Key Metrics")
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+total_gex = float(df['Net_GEX_B'].sum())
+call_gex = float(df['Call_GEX'].sum())
+put_gex = float(df['Put_GEX'].sum())
+
+with col1:
+    delta_class = "delta-up" if total_gex > 0 else "delta-down"
+    delta_text = "DAMPENING" if total_gex > 0 else "AMPLIFYING"
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Total Net GEX</div>
+        <div class="metric-value">{total_gex:.2f}</div>
+        <div class="metric-delta {delta_class}">{delta_text}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col2:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Call GEX</div>
+        <div class="metric-value" style="color: #39ff14;">{call_gex:.4f}B</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col3:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Put GEX</div>
+        <div class="metric-value" style="color: #ff4757;">{put_gex:.4f}B</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col4:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Futures LTP</div>
+        <div class="metric-value" style="color: #00f5ff;">₹{futures_ltp:,.2f}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col5:
+    straddle = atm_info['atm_straddle_premium'] if atm_info else 0
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">ATM Straddle</div>
+        <div class="metric-value" style="color: #ff00ff;">₹{straddle:.2f}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ============================================================================
+# FLOW ANALYSIS
+# ============================================================================
+
+if flow_metrics:
+    st.markdown("---")
+    st.markdown("### 📈 Flow Analysis")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        gex_bias = flow_metrics['gex_bias']
+        gex_val = flow_metrics['gex_near_total']
         
-        flow = calculate_flow_metrics(df, futures)
-        print(f"   GEX Bias: {flow['gex_bias']}")
-        print(f"   DEX Bias: {flow['dex_bias']}")
+        if "DAMPENING" in gex_bias:
+            st.markdown(f"""
+            <div class="dampening-box">
+                <h3>GEX: {gex_bias}</h3>
+                <p>Near-term: {gex_val:.2f}</p>
+                <p style="font-size: 0.85rem; opacity: 0.7;">Market makers will stabilize price</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="amplifying-box">
+                <h3>GEX: {gex_bias}</h3>
+                <p>Near-term: {gex_val:.2f}</p>
+                <p style="font-size: 0.85rem; opacity: 0.7;">Market makers will amplify moves</p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    with col2:
+        dex_bias = flow_metrics['dex_bias']
+        dex_val = flow_metrics['dex_near_total']
+        
+        if "BULLISH" in dex_bias:
+            st.markdown(f"""
+            <div class="bullish-box">
+                <h3 style="color: #00f5ff;">DEX: {dex_bias}</h3>
+                <p style="color: #fff;">Near-term: {dex_val:.2f}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="bearish-box">
+                <h3 style="color: #ff6600;">DEX: {dex_bias}</h3>
+                <p style="color: #fff;">Near-term: {dex_val:.2f}</p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    with col3:
+        combined = flow_metrics['combined_bias']
+        st.markdown(f"""
+        <div class="glass-card" style="text-align: center;">
+            <div style="font-family: 'Rajdhani', sans-serif; color: rgba(255,255,255,0.6); font-size: 0.9rem;">COMBINED SIGNAL</div>
+            <div style="font-family: 'Orbitron', monospace; color: #fff; font-size: 1.1rem; margin-top: 0.5rem;">{combined}</div>
+            <div style="font-family: 'Share Tech Mono', monospace; color: #00f5ff; margin-top: 0.5rem;">
+                Signal: {flow_metrics['combined_signal']:.2f}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ============================================================================
+# GAMMA FLIP ZONES
+# ============================================================================
+
+try:
+    gamma_flips = detect_gamma_flips(df)
+    if gamma_flips:
+        st.markdown(f"""
+        <div class="gamma-flip-alert">
+            <strong>⚡ {len(gamma_flips)} Gamma Flip Zone(s) Detected!</strong> - High volatility transition areas
+        </div>
+        """, unsafe_allow_html=True)
+        
+        for flip in gamma_flips:
+            st.caption(f"  • {flip['lower']} - {flip['upper']}: {flip['type']}")
+except:
+    gamma_flips = []
+
+# ============================================================================
+# CHARTS
+# ============================================================================
+
+st.markdown("---")
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 GEX Profile", "📈 DEX Profile", "🎯 Hedging Pressure", "📋 Data Table"])
+
+# Chart template
+chart_template = dict(
+    paper_bgcolor='rgba(10, 10, 15, 0.8)',
+    plot_bgcolor='rgba(10, 10, 15, 0.8)',
+    font=dict(family='Rajdhani, sans-serif', color='rgba(255,255,255,0.8)'),
+    xaxis=dict(gridcolor='rgba(255,255,255,0.05)', zerolinecolor='rgba(255,255,255,0.1)'),
+    yaxis=dict(gridcolor='rgba(255,255,255,0.05)', zerolinecolor='rgba(255,255,255,0.1)')
+)
+
+with tab1:
+    mode_text = f"[HISTORICAL - {hist_time.strftime('%I:%M %p')}]" if is_historical else "[LIVE]"
+    st.subheader(f"{symbol} Gamma Exposure {mode_text}")
+    
+    fig = go.Figure()
+    
+    colors = ['#39ff14' if x > 0 else '#ff4757' for x in df['Net_GEX_B']]
+    
+    fig.add_trace(go.Bar(
+        y=df['Strike'],
+        x=df['Net_GEX_B'],
+        orientation='h',
+        marker_color=colors,
+        marker_line_color=colors,
+        marker_line_width=1,
+        name='Net GEX',
+        hovertemplate='<b>Strike:</b> %{y}<br><b>Net GEX:</b> %{x:.4f}B<extra></extra>'
+    ))
+    
+    # Gamma flip zones
+    if gamma_flips:
+        max_gex = df['Net_GEX_B'].abs().max()
+        for flip in gamma_flips:
+            fig.add_shape(
+                type="rect",
+                y0=flip['lower'],
+                y1=flip['upper'],
+                x0=-max_gex * 1.5,
+                x1=max_gex * 1.5,
+                fillcolor="rgba(255, 215, 0, 0.15)",
+                layer="below",
+                line_width=0
+            )
+    
+    fig.add_hline(
+        y=futures_ltp,
+        line_dash="dash",
+        line_color="#00f5ff",
+        line_width=3,
+        annotation_text=f"Futures: ₹{futures_ltp:,.2f}",
+        annotation_font_color="#00f5ff"
+    )
+    
+    fig.update_layout(
+        height=600,
+        xaxis_title="Net GEX (Billions)",
+        yaxis_title="Strike Price",
+        hovermode='closest',
+        **chart_template
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Interpretation
+    if total_gex > 100:
+        st.success("🟢 **Strong Volatility Dampening**: MMs will aggressively buy dips and sell rallies. Expect tight range.")
+    elif total_gex > 0:
+        st.info("🟢 **Mild Dampening**: Some price stabilization expected.")
+    elif total_gex > -100:
+        st.warning("🔴 **Mild Amplifying**: MMs may amplify moves. Trade with caution.")
+    else:
+        st.error("🔴 **Strong Volatility Amplifying**: High volatility! MMs will amplify directional moves.")
+
+with tab2:
+    st.subheader(f"{symbol} Delta Exposure")
+    
+    fig2 = go.Figure()
+    
+    dex_colors = ['#00f5ff' if x > 0 else '#ff6600' for x in df['Net_DEX_B']]
+    
+    fig2.add_trace(go.Bar(
+        y=df['Strike'],
+        x=df['Net_DEX_B'],
+        orientation='h',
+        marker_color=dex_colors,
+        name='Net DEX',
+        hovertemplate='<b>Strike:</b> %{y}<br><b>Net DEX:</b> %{x:.4f}B<extra></extra>'
+    ))
+    
+    fig2.add_hline(y=futures_ltp, line_dash="dash", line_color="#ff00ff", line_width=3)
+    
+    fig2.update_layout(
+        height=600,
+        xaxis_title="Net DEX (Billions)",
+        yaxis_title="Strike Price",
+        **chart_template
+    )
+    
+    st.plotly_chart(fig2, use_container_width=True)
+
+with tab3:
+    st.subheader(f"{symbol} Hedging Pressure Index")
+    
+    fig3 = go.Figure()
+    
+    fig3.add_trace(go.Bar(
+        y=df['Strike'],
+        x=df['Hedging_Pressure'],
+        orientation='h',
+        marker=dict(
+            color=df['Hedging_Pressure'],
+            colorscale=[[0, '#ff4757'], [0.5, '#ffd700'], [1, '#39ff14']],
+            showscale=True,
+            colorbar=dict(title="Pressure %", tickfont=dict(color='white'))
+        ),
+        name='Hedging Pressure',
+        hovertemplate='<b>Strike:</b> %{y}<br><b>Pressure:</b> %{x:.2f}%<extra></extra>'
+    ))
+    
+    fig3.add_hline(y=futures_ltp, line_dash="dash", line_color="#00f5ff", line_width=3)
+    
+    fig3.update_layout(
+        height=600,
+        xaxis_title="Hedging Pressure (%)",
+        yaxis_title="Strike Price",
+        **chart_template
+    )
+    
+    st.plotly_chart(fig3, use_container_width=True)
+
+with tab4:
+    st.subheader("Strike-wise Analysis")
+    
+    display_cols = ['Strike', 'Call_OI', 'Put_OI', 'Call_IV', 'Put_IV', 'Net_GEX_B', 'Net_DEX_B', 'Hedging_Pressure']
+    display_df = df[[c for c in display_cols if c in df.columns]].copy()
+    
+    st.dataframe(display_df, use_container_width=True, height=400)
+    
+    csv = df.to_csv(index=False)
+    timestamp_str = hist_time.strftime('%Y%m%d_%H%M') if hist_time else get_ist_time().strftime('%Y%m%d_%H%M')
+    
+    st.download_button(
+        label="📥 Download CSV",
+        data=csv,
+        file_name=f"NYZTrade_{symbol}_exp{expiry_index}_{timestamp_str}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+# ============================================================================
+# FOOTER
+# ============================================================================
+
+ist_time = get_ist_time()
+
+st.markdown(f"""
+<div class="ultra-footer">
+    <span>⏰ {ist_time.strftime('%H:%M:%S')} IST</span> | 
+    <span>📅 Expiry: {atm_info.get('expiry_date', 'N/A') if atm_info else 'N/A'}</span> | 
+    <span>{'📜 Historical' if is_historical else '🔴 Live'}: {symbol}</span> | 
+    <span>💡 NYZTrade YouTube</span>
+</div>
+""", unsafe_allow_html=True)
+
+# ============================================================================
+# AUTO-REFRESH
+# ============================================================================
+
+if auto_refresh and user_tier == "premium" and st.session_state.is_live_mode:
+    elapsed = time.time() - st.session_state.countdown_start
+    if elapsed >= refresh_interval:
+        st.session_state.countdown_start = time.time()
+        st.rerun()
+    else:
+        time.sleep(1)
+        st.rerun()
